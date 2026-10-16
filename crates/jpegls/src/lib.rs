@@ -33,12 +33,23 @@ mod legacy;
 mod predictor;
 mod run_mode;
 
-pub use decode::{decode, decode_with_options};
+pub use decode::{decode, decode_image, decode_with_options, DecodedImage};
 pub use encode::{encode, encode_with_options};
 pub use error::CodecError;
 
 /// DICOM Transfer Syntax UID for JPEG-LS Lossless.
 pub const TRANSFER_SYNTAX_UID: &str = "1.2.840.10008.1.2.4.80";
+
+/// Capability marker for this feature set — present in forks/releases that
+/// ship [`decode_image`] and 3-component planar (ILV 0) decoding, and absent
+/// from codecs that predate them.
+///
+/// Downstreams that pull this crate through a temporary `[patch.crates-io]`
+/// override (pending an upstream release) can reference this constant in a
+/// build-time assertion or tripwire test, so the patch cannot be silently
+/// dropped back to a version without these capabilities. The value lists the
+/// capabilities, newest last.
+pub const FEATURE_CAPS: &str = "decode_image;rgb-ilv0-planar";
 
 /// Bitstream profile selecting the entropy-coded scan format.
 ///
