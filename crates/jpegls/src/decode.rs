@@ -642,74 +642,97 @@ pub(crate) fn decode_scan_t87(
     base_offset: usize,
 ) -> Result<usize, CodecError> {
     let mut br = BitReader::new(scan_data);
-    let near = ctx.near;
-    let max_val = ctx.max_val;
-    let range = ctx.range;
 
     let mut prev = vec![0i32; width + 2];
     let mut cur = vec![0i32; width + 2];
 
-    for y in 0..height {
-        cur[0] = prev[1];
-        prev[width + 1] = prev[width];
-
-        let mut x = 0usize;
-        while x < width {
-            let ra = cur[x];
-            let rb = prev[x + 1];
-            let rc = prev[x];
-            let rd = prev[x + 2];
-
-            let d1 = rd - rb;
-            let d2 = rb - rc;
-            let d3 = rc - ra;
-
-            if d1.abs() <= near && d2.abs() <= near && d3.abs() <= near {
-                let before = x;
-                x = match run_mode::decode_run(&mut br, &mut ctx, &mut cur, &prev, x, width) {
-                    Ok(v) => v,
-                    Err(e) => return Err(scan_error(e, base_offset + br.pos())),
-                };
-                for (xi, slot) in (before..x).zip(&cur[before + 1..x + 1]) {
-                    pixels[y * width + xi] = *slot as u16;
-                }
-                continue;
-            }
-
-            let (q, sign) = ctx.get_context_index(d1, d2, d3);
-            let k = ctx.compute_k(q);
-            let mut px = predict_med(ra, rb, rc);
-            px += sign * ctx.c[q];
-            px = clamp(px, 0, max_val);
-
-            let correction = if k == 0 && near == 0 && 2 * ctx.b[q] <= -ctx.n[q] {
-                -1
-            } else {
-                0
-            };
-            let mapped = match br.read_limited_golomb(k, ctx.limit, ctx.qbpp) {
-                Ok(v) => v,
-                Err(e) => return Err(scan_error(e, base_offset + br.pos())),
-            };
-            let err_q = run_mode::unmap_error(mapped, correction);
-            run_mode::check_err_in_range(err_q, range)?;
-            ctx.update_stats(q, err_q);
-
-            let recon = run_mode::fix_reconstructed(
-                px + sign * err_q * (2 * near + 1),
-                near,
-                range,
-                max_val,
-            );
-            cur[x + 1] = recon;
-            pixels[y * width + x] = recon as u16;
-            x += 1;
-        }
-
+    for row in pixels.chunks_exact_mut(width).take(height) {
+        decode_line(&mut br, &mut ctx, &mut prev, &mut cur, row, base_offset)?;
         std::mem::swap(&mut prev, &mut cur);
     }
 
     Ok(br.marker_pos())
+}
+
+/// Decode one line of one component into `cur` (offset-1 layout, see
+/// [`run_mode`]) and `out_row`, whose length is the line width. Sets the
+/// line's edge slots (T.87 A.2.1) first.
+#[inline(always)]
+fn decode_line(
+    br: &mut BitReader<'_>,
+    ctx: &mut ContextModel,
+    prev: &mut [i32],
+    cur: &mut [i32],
+    out_row: &mut [u16],
+    base_offset: usize,
+) -> Result<(), CodecError> {
+    let width = out_row.len();
+    let near = ctx.near;
+    cur[0] = prev[1];
+    prev[width + 1] = prev[width];
+
+    let mut x = 0usize;
+    while x < width {
+        let ra = cur[x];
+        let rb = prev[x + 1];
+        let rc = prev[x];
+        let rd = prev[x + 2];
+
+        if (rd - rb).abs() <= near && (rb - rc).abs() <= near && (rc - ra).abs() <= near {
+            let before = x;
+            x = match run_mode::decode_run(br, ctx, cur, prev, x, width) {
+                Ok(v) => v,
+                Err(e) => return Err(scan_error(e, base_offset + br.pos())),
+            };
+            for (dst, slot) in out_row[before..x].iter_mut().zip(&cur[before + 1..x + 1]) {
+                *dst = *slot as u16;
+            }
+            continue;
+        }
+
+        let recon = decode_regular(br, ctx, [ra, rb, rc, rd], base_offset)?;
+        cur[x + 1] = recon;
+        out_row[x] = recon as u16;
+        x += 1;
+    }
+    Ok(())
+}
+
+/// Decode one regular-mode sample (T.87 A.4-A.6) from its causal neighbours
+/// `[Ra, Rb, Rc, Rd]` and return the reconstructed value.
+#[inline(always)]
+fn decode_regular(
+    br: &mut BitReader<'_>,
+    ctx: &mut ContextModel,
+    [ra, rb, rc, rd]: [i32; 4],
+    base_offset: usize,
+) -> Result<i32, CodecError> {
+    let (near, max_val, range) = (ctx.near, ctx.max_val, ctx.range);
+    let (q, sign) = ctx.get_context_index(rd - rb, rb - rc, rc - ra);
+    let k = ctx.compute_k(q);
+    let mut px = predict_med(ra, rb, rc);
+    px += sign * ctx.c[q];
+    px = clamp(px, 0, max_val);
+
+    let correction = if k == 0 && near == 0 && 2 * ctx.b[q] <= -ctx.n[q] {
+        -1
+    } else {
+        0
+    };
+    let mapped = match br.read_limited_golomb(k, ctx.limit, ctx.qbpp) {
+        Ok(v) => v,
+        Err(e) => return Err(scan_error(e, base_offset + br.pos())),
+    };
+    let err_q = run_mode::unmap_error(mapped, correction);
+    run_mode::check_err_in_range(err_q, range)?;
+    ctx.update_stats(q, err_q);
+
+    Ok(run_mode::fix_reconstructed(
+        px + sign * err_q * (2 * near + 1),
+        near,
+        range,
+        max_val,
+    ))
 }
 
 // ---------------------------------------------------------------------------
