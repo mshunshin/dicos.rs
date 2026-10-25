@@ -52,6 +52,7 @@ fn clamp_threshold(i: i32, lo: i32, hi: i32) -> i32 {
 }
 
 /// The T.87 context model state used during encoding and decoding.
+#[derive(Clone)]
 pub(crate) struct ContextModel {
     // --- Quantization thresholds (T.87 A.2.1 / A.3) ---
     pub t1: i32,
@@ -154,11 +155,7 @@ impl ContextModel {
     /// Compute the default T1/T2/T3 thresholds (T.87 A.2.1).
     pub(crate) fn default_thresholds(max_val: i32, near: i32) -> (i32, i32, i32) {
         if max_val >= 128 {
-            let factor = (max_val.min(4095) + 128) / 256;
-            let t1 = clamp_threshold(factor * (BASIC_T1 - 2) + 2 + 3 * near, near + 1, max_val);
-            let t2 = clamp_threshold(factor * (BASIC_T2 - 3) + 3 + 5 * near, t1, max_val);
-            let t3 = clamp_threshold(factor * (BASIC_T3 - 4) + 4 + 7 * near, t2, max_val);
-            (t1, t2, t3)
+            Self::scaled_thresholds(max_val, near)
         } else {
             let factor = 256 / (max_val + 1);
             let t1 = clamp_threshold((BASIC_T1 / factor + 3 * near).max(2), near + 1, max_val);
@@ -166,6 +163,17 @@ impl ContextModel {
             let t3 = clamp_threshold((BASIC_T3 / factor + 7 * near).max(4), t2, max_val);
             (t1, t2, t3)
         }
+    }
+
+    /// The `MAXVAL >= 128` branch of [`Self::default_thresholds`]. CharLS 1.x
+    /// (e.g. as bundled in DCMTK) used it for every MAXVAL (CharLS #51), so
+    /// its 6- and 7-bit streams without an LSE need these thresholds.
+    pub(crate) fn scaled_thresholds(max_val: i32, near: i32) -> (i32, i32, i32) {
+        let factor = (max_val.min(4095) + 128) / 256;
+        let t1 = clamp_threshold(factor * (BASIC_T1 - 2) + 2 + 3 * near, near + 1, max_val);
+        let t2 = clamp_threshold(factor * (BASIC_T2 - 3) + 3 + 5 * near, t1, max_val);
+        let t3 = clamp_threshold(factor * (BASIC_T3 - 4) + 4 + 7 * near, t2, max_val);
+        (t1, t2, t3)
     }
 
     /// Near-aware gradient quantization into one of 9 buckets (-4..=4), T.87

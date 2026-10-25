@@ -11,15 +11,18 @@
 //! reads all three interleave modes — one scan per component (`ILV = 0`),
 //! line-interleaved (`ILV = 1`, DCMTK's default for colour) and
 //! sample-interleaved (`ILV = 2`, up to four components per scan) — and any
-//! mix of them across a frame's scans. [`encode_image`] writes `ILV = 0`. Restart markers inside a scan are
-//! rejected as `Unsupported`; a `DRI` segment on its own is skipped. Verified
-//! against the T.87 conformance streams, CharLS and DCMTK output.
+//! mix of them across a frame's scans, with restart markers (`DRI` + `RSTm`)
+//! and the HP colour transforms HP1–HP3 (APP8 `"mrfx"`), as CharLS reads them.
+//! [`encode_image`] writes `ILV = 0`. Verified against the T.87 conformance
+//! streams, CharLS and DCMTK output.
 //!
 //! The decoder also accepts what CharLS accepts from real-world encoders:
-//! `0x00` or `0xFF` padding before the next marker, LSE / COM / APPn segments
-//! between scans, an LSE `RESET` of 0 (the default), and a non-zero (reserved)
-//! SOF `Tq` or SOS `Ah`. An HP colour transform (APP8 `"mrfx"`) is rejected
-//! rather than decoded to the wrong colours.
+//! `0x00` or `0xFF` padding before the next marker, LSE / COM / APPn / DRI
+//! segments between scans, an LSE `RESET` of 0 (the default), and a non-zero
+//! (reserved) SOF `Tq` or SOS `Ah`. A stream that fails to decode under T.87
+//! is retried under the two CharLS codings found in the wild — CharLS 1.x's
+//! default thresholds below 8 bits (DCMTK `+pc`), and CharLS's handling of an
+//! LSE `MAXVAL` — so those files decode too.
 //!
 //! # Profiles
 //!
@@ -54,7 +57,8 @@ pub const TRANSFER_SYNTAX_UID: &str = "1.2.840.10008.1.2.4.80";
 /// Capability marker for this feature set — present in forks/releases that
 /// ship [`decode_image`], 3-component planar (ILV 0) decoding, line- /
 /// sample-interleaved (ILV 1 / 2) decoding, any component count and mixed
-/// interleave across scans, and absent from codecs that predate them.
+/// interleave across scans, restart markers, HP colour transforms and the
+/// CharLS-coding retries, and absent from codecs that predate them.
 ///
 /// Downstreams that pull this crate from a fork (pending an upstream release)
 /// should use a git dependency pinned to an exact `rev` — a
@@ -64,7 +68,7 @@ pub const TRANSFER_SYNTAX_UID: &str = "1.2.840.10008.1.2.4.80";
 /// cannot silently resolve to a version without these capabilities. The value
 /// lists the capabilities, newest last.
 pub const FEATURE_CAPS: &str =
-    "decode_image;rgb-ilv0-planar;ilv1-line;ilv2-sample;nf-any;mixed-ilv";
+    "decode_image;rgb-ilv0-planar;ilv1-line;ilv2-sample;nf-any;mixed-ilv;restart;hp-transform;charls-retry";
 
 /// Bitstream profile selecting the entropy-coded scan format.
 ///

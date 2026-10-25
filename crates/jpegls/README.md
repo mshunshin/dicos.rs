@@ -18,11 +18,16 @@ precision `2..=16`, for:
   (falling back to frame order when those are unusable, as CharLS ignores
   them). `encode_image` writes `ILV = 0`, for any component count.
 
-Rejected as `Unsupported`: restart markers inside a scan (`RSTn`), LSE mapping
-tables, component subsampling, NEAR differing between scans, and HP colour
-transforms. Rejected as `InvalidData`: a non-zero point transform, an
-impossible scan component count, or an interleave mode that does not fit it.
-A `DRI` segment on its own is tolerated and skipped.
+Restart markers (`DRI` + `RSTm`) are decoded, every interval starting from
+fresh statistics as CharLS does, and so are HP colour transforms HP1–HP3
+(APP8 `"mrfx"`; three lossless 8- or 16-bit components in an interleaved scan,
+CharLS 3.0's rule).
+
+Rejected as `Unsupported`: LSE mapping tables, component subsampling, NEAR
+differing between scans, and the HP lossy / matrix transforms (4, 5). Rejected
+as `InvalidData`: a non-zero point transform, an impossible scan component
+count, an interleave mode that does not fit it, an HP transform where it cannot
+apply, and a missing or out-of-sequence `RSTm`.
 
 Interop is verified bit-exactly against the **ITU-T T.87 conformance**
 streams (HP encoder), **CharLS** test streams and CharLS-encoded images
@@ -41,14 +46,24 @@ Like CharLS, the decoder accepts these deviations found in real files:
 - an LSE `RESET` of 0, meaning the default (64), as for the other fields;
 - a non-zero SOF `Tq` or SOS `Ah`, both of which JPEG-LS leaves unused.
 
-An APP8 `"mrfx"` segment (HP colour transform, written by the HP codec and
-CharLS) is rejected rather than ignored, since ignoring it would decode the
-wrong colours. Other APP8 segments, such as a SPIFF header, are skipped.
+APP8 segments other than `"mrfx"`, such as CharLS's SPIFF header, are
+skipped.
 
-Where CharLS departs from T.87 the decoder follows T.87: a `RESET` above 255
-is used as written (CharLS truncates it to 8 bits), and an LSE `MAXVAL` sets
-`RANGE` / `LIMIT` / `qbpp` (CharLS derives those from the sample precision).
-DCMTK never writes either case.
+Two CharLS codings differ from T.87, and files using them exist. A stream
+that fails under T.87 is decoded again under each one its header allows; a
+stream that decodes under T.87 is never reinterpreted:
+
+- **CharLS 1.x default thresholds** (the copy bundled in DCMTK and others):
+  for MAXVAL < 128 it used the MAXVAL >= 128 formula (CharLS #51) and wrote no
+  LSE. DCMTK's `dcmcjpls +pc` produces such 6- and 7-bit streams.
+- **CharLS's LSE MAXVAL**: CharLS derives `RANGE`, `LIMIT` and `qbpp` from the
+  sample precision and uses an LSE `MAXVAL` only for the default thresholds,
+  where T.87 derives all of them from `MAXVAL`. Any CharLS stream with an LSE
+  `MAXVAL` below `2^P - 1` is coded this way.
+
+Where CharLS departs from T.87 in a way that cannot be told apart, the decoder
+follows T.87: a `RESET` above 255 is used as written (CharLS truncates it to 8
+bits; DCMTK refuses to write one).
 
 A caution for producers rather than a decoder rule: CharLS releases built before
 commit 3790e10 (April 2023; e.g. the CharLS 2.4 inside pillow-jpls 1.3.2) are

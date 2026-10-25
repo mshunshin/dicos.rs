@@ -268,7 +268,8 @@ fn charls_generated_streams() {
     // Streams CharLS (via pillow-jpls) encoded, with CharLS's own decode as
     // the expectation: four components in each interleave mode, the SPIFF
     // header, custom presets. `-mx` streams carry an LSE MAXVAL below 2^P - 1,
-    // which CharLS codes differently from T.87; they are rejected for now.
+    // which CharLS codes differently from T.87: they decode through the
+    // CharLS retry.
     let Some(dir) = fixture_dir("charls-gen") else {
         return;
     };
@@ -293,12 +294,8 @@ fn charls_generated_streams() {
             .iter()
             .find_map(|p| p.strip_prefix("near"))
             .map_or(0, |n| n.parse().unwrap());
-        let result = jpegls::decode_image(&std::fs::read(&jls).unwrap());
-        if stem.contains("-mx") {
-            assert!(result.is_err(), "{stem}: decoded under T.87 rules");
-            continue;
-        }
-        let img = result.unwrap_or_else(|e| panic!("{stem}: {e}"));
+        let img = jpegls::decode_image(&std::fs::read(&jls).unwrap())
+            .unwrap_or_else(|e| panic!("{stem}: {e}"));
         assert_matches(
             &stem,
             &img,
@@ -423,9 +420,70 @@ const CHARLS_STREAMS: &[(&str, Expect)] = &[
     ),
     ("8bit-monochrome-2x2", Expect::Decodes),
     ("t8sse0", Expect::Unsupported),
-    ("banny-hp1", Expect::Unsupported),
-    ("banny-hp2", Expect::Unsupported),
-    ("banny-hp3", Expect::Unsupported),
+    (
+        "banny-hp1",
+        Expect::Matches {
+            reference: "banny.ppm",
+            near: 0,
+            ilv: 1,
+        },
+    ),
+    (
+        "banny-hp2",
+        Expect::Matches {
+            reference: "banny.ppm",
+            near: 0,
+            ilv: 1,
+        },
+    ),
+    (
+        "banny-hp3",
+        Expect::Matches {
+            reference: "banny.ppm",
+            near: 0,
+            ilv: 1,
+        },
+    ),
+    (
+        "test8_ilv_none_rm_7",
+        Expect::Matches {
+            reference: "test8.ppm",
+            near: 0,
+            ilv: 0,
+        },
+    ),
+    (
+        "test8_ilv_line_rm_7",
+        Expect::Matches {
+            reference: "test8.ppm",
+            near: 0,
+            ilv: 1,
+        },
+    ),
+    (
+        "test8_ilv_sample_rm_7",
+        Expect::Matches {
+            reference: "test8.ppm",
+            near: 0,
+            ilv: 2,
+        },
+    ),
+    (
+        "test8_ilv_sample_rm_300",
+        Expect::Matches {
+            reference: "test8.ppm",
+            near: 0,
+            ilv: 2,
+        },
+    ),
+    (
+        "test16_rm_5",
+        Expect::Matches {
+            reference: "test16.pgm",
+            near: 0,
+            ilv: 0,
+        },
+    ),
     ("fuzzy-input-bad-run-mode-golomb-code", Expect::Fails),
     ("fuzzy-input-no-valid-bits-at-the-end", Expect::Fails),
     ("fuzzy_input_golomb_16", Expect::Fails),
@@ -462,4 +520,23 @@ fn charls_reference_streams() {
             Expect::Fails => assert!(result.is_err(), "{stem} decoded"),
         }
     }
+}
+
+#[test]
+fn feature_caps_lists_every_capability() {
+    // Downstream tripwires match on these names; keep them exact.
+    assert_eq!(
+        jpegls::FEATURE_CAPS.split(';').collect::<Vec<_>>(),
+        [
+            "decode_image",
+            "rgb-ilv0-planar",
+            "ilv1-line",
+            "ilv2-sample",
+            "nf-any",
+            "mixed-ilv",
+            "restart",
+            "hp-transform",
+            "charls-retry"
+        ]
+    );
 }

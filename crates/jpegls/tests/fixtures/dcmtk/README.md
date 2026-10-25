@@ -12,6 +12,9 @@ Colour streams are line-interleaved (`ilv1`, DCMTK's default `+il`) or
 sample-interleaved (`ilv2`, `+is`); DCMTK has no planar option for colour.
 `near2` streams use `+en` (NEAR 2). Images stored with more than 8 bits are
 encoded with P = 16 and an LSE segment, as DCMTK always does above 12 bits.
+`pc` streams use DCMTK's "cooked" encoder (`+pc`), which codes P = BitsStored;
+at 6 and 7 bits its CharLS 1.x picks non-T.87 default thresholds (CharLS #51)
+and writes no LSE, so they decode only through the decoder's CharLS 1.x retry.
 
 These end in DCMTK's extended EOI padding (`FF FF D9`):
 - `mixed-37x24-8-rgb-ilv1-near2`
@@ -25,3 +28,6 @@ These end in DCMTK's extended EOI padding (`FF FF D9`):
 - `mixed-33x21-16-mono-ilv0`
 - `mixed-40x29-16-mono-ilv0`
 - `mixed-40x29-16-mono-ilv0-near2`
+- `mixed-48x32-6-rgb-ilv2-pc`
+- `mixed-48x32-7-rgb-ilv1-pc`
+- `mixed-48x32-7-rgb-ilv2-pc`

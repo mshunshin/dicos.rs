@@ -157,7 +157,7 @@ expectations were checked against the synthetic source.
 - `-presets`: LSE T1/T2/T3/RESET = 30/100/400/200.
 - `-mx{{MAXVAL}}`: an LSE MAXVAL below 2^P - 1. CharLS derives RANGE, LIMIT and
   qbpp from P rather than MAXVAL, unlike T.87, so a strictly T.87 decoder
-  rejects these.
+  rejects these; this one decodes them by retrying under CharLS's rule.
 
 The CharLS encoder in this pillow-jpls build is not lossless for four
 components in sample-interleaved (ILV 2) mode: before CharLS commit 3790e10
