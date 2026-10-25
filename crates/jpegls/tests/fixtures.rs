@@ -158,6 +158,161 @@ fn dcmtk_interleaved_truncation_is_an_error() {
     }
 }
 
+/// The SOS segment and entropy data of a single-scan stream (everything from
+/// SOS up to EOI, without any 0xFF fill before EOI).
+fn scan_segment(stream: &[u8]) -> Vec<u8> {
+    let sos = stream.windows(2).position(|p| p == [0xFF, 0xDA]).unwrap();
+    let mut end = stream.len() - 2;
+    while stream[end - 1] == 0xFF {
+        end -= 1;
+    }
+    stream[sos..end].to_vec()
+}
+
+/// `scan` with its component selectors replaced by `selectors`.
+fn with_selectors(scan: &[u8], selectors: &[u8]) -> Vec<u8> {
+    let mut out = scan.to_vec();
+    assert_eq!(usize::from(out[4]), selectors.len());
+    for (k, &cs) in selectors.iter().enumerate() {
+        out[5 + 2 * k] = cs;
+    }
+    out
+}
+
+#[test]
+fn mixed_interleave_spliced_from_dcmtk_scans() {
+    // Nf = 4 coded as DCMTK's 3-component line- or sample-interleaved scan
+    // plus a 1-component scan from our encoder. A scan's coding depends only
+    // on P, the presets and NEAR (both 8-bit defaults here), so the spliced
+    // stream is valid T.87 with known samples.
+    let Some(dir) = fixture_dir("dcmtk") else {
+        return;
+    };
+    for ilv in [1u8, 2] {
+        let stem = format!("mixed-37x24-8-rgb-ilv{ilv}");
+        let rgb = std::fs::read(dir.join(format!("{stem}.jls"))).unwrap();
+        let reference = read_pnm(&dir.join(format!("{stem}.ppm")));
+        let (w, h) = (reference.width, reference.height);
+        let mono: Vec<u16> = (0..w * h)
+            .map(|i| ((i * 13 + i / w) % 256) as u16)
+            .collect();
+        let mut mono_stream = Vec::new();
+        jpegls::encode_image(
+            &mono,
+            w,
+            h,
+            1,
+            &jpegls::EncodeOptions::default(),
+            &mut mono_stream,
+        )
+        .unwrap();
+        let (rgb_scan, mono_scan) = (scan_segment(&rgb), scan_segment(&mono_stream));
+        let rgb_planes: Vec<Vec<u16>> = (0..3)
+            .map(|c| {
+                reference
+                    .samples
+                    .iter()
+                    .skip(c)
+                    .step_by(3)
+                    .copied()
+                    .collect()
+            })
+            .collect();
+
+        let mut frame = vec![0xFF, 0xD8, 0xFF, 0xF7, 0x00, 20, 8];
+        frame.extend_from_slice(&(h as u16).to_be_bytes());
+        frame.extend_from_slice(&(w as u16).to_be_bytes());
+        frame.push(4);
+        for id in 1..=4u8 {
+            frame.extend_from_slice(&[id, 0x11, 0x00]);
+        }
+        let splice = |scans: [Vec<u8>; 2]| {
+            let mut s = frame.clone();
+            s.extend(scans.concat());
+            s.extend_from_slice(&[0xFF, 0xD9]);
+            jpegls::decode_image(&s).unwrap_or_else(|e| panic!("ILV {ilv}: {e}"))
+        };
+        let in_frame_order = [rgb_planes.concat(), mono.clone()].concat();
+
+        // RGB scan first, selectors 1-3 then 4.
+        let img = splice([
+            with_selectors(&rgb_scan, &[1, 2, 3]),
+            with_selectors(&mono_scan, &[4]),
+        ]);
+        assert_eq!((img.components, img.interleave_mode), (4, ilv));
+        assert_eq!(img.samples, in_frame_order, "ILV {ilv}, frame order");
+
+        // Component 4's scan first: the selectors still place it last.
+        let img = splice([
+            with_selectors(&mono_scan, &[4]),
+            with_selectors(&rgb_scan, &[1, 2, 3]),
+        ]);
+        assert_eq!(img.interleave_mode, 0);
+        assert_eq!(img.samples, in_frame_order, "ILV {ilv}, by selector");
+
+        // Selectors naming no component: scan order decides.
+        let img = splice([
+            with_selectors(&mono_scan, &[9]),
+            with_selectors(&rgb_scan, &[9, 9, 9]),
+        ]);
+        assert_eq!(
+            img.samples,
+            [mono.clone(), rgb_planes.concat()].concat(),
+            "ILV {ilv}, fallback"
+        );
+    }
+}
+
+#[test]
+fn charls_generated_streams() {
+    // Streams CharLS (via pillow-jpls) encoded, with CharLS's own decode as
+    // the expectation: four components in each interleave mode, the SPIFF
+    // header, custom presets. `-mx` streams carry an LSE MAXVAL below 2^P - 1,
+    // which CharLS codes differently from T.87; they are rejected for now.
+    let Some(dir) = fixture_dir("charls-gen") else {
+        return;
+    };
+    let mut streams: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "jls"))
+        .collect();
+    streams.sort();
+    assert!(streams.len() >= 15, "found {} streams", streams.len());
+    for jls in streams {
+        let stem = jls.file_stem().unwrap().to_str().unwrap().to_string();
+        let parts: Vec<&str> = stem.split('-').collect();
+        let (components, ext) = match parts[3] {
+            "gray" => (1u8, "pgm"),
+            "rgb" => (3, "ppm"),
+            "rgba" => (4, "pam"),
+            other => panic!("{stem}: unknown kind {other}"),
+        };
+        let ilv: u8 = parts[4].strip_prefix("ilv").unwrap().parse().unwrap();
+        let near: u8 = parts[5..]
+            .iter()
+            .find_map(|p| p.strip_prefix("near"))
+            .map_or(0, |n| n.parse().unwrap());
+        let result = jpegls::decode_image(&std::fs::read(&jls).unwrap());
+        if stem.contains("-mx") {
+            assert!(result.is_err(), "{stem}: decoded under T.87 rules");
+            continue;
+        }
+        let img = result.unwrap_or_else(|e| panic!("{stem}: {e}"));
+        assert_matches(
+            &stem,
+            &img,
+            &read_pnm(&dir.join(format!("{stem}.{ext}"))),
+            0,
+        );
+        assert_eq!(
+            (img.components, img.interleave_mode, img.near),
+            (components, ilv, near),
+            "{stem}: metadata"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // T.87 conformance + CharLS
 // ---------------------------------------------------------------------------
