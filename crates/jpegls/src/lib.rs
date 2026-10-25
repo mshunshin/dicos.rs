@@ -5,13 +5,20 @@
 //!
 //! # Conformance scope
 //!
-//! Conformant T.87 for **single-component** images and **multi-component
-//! planar** images (`ILV = 0`, one scan per component, e.g. RGB, through
-//! [`decode_image`] / [`encode_image`]), precision `2..=16`, with LSE ID=1
-//! presets, run mode, and near-lossless. Line- and sample-interleaved scans
-//! (`ILV ≠ 0`) and restart markers inside a scan are rejected as
-//! `Unsupported`; a `DRI` segment on its own is skipped. Verified against
-//! CharLS fixtures.
+//! Conformant T.87 for **single-component** images and **3-component** images
+//! (e.g. RGB) through [`decode_image`], precision `2..=16`, with LSE ID=1
+//! presets, run mode, and near-lossless. The decoder reads all three
+//! interleave modes: one scan per component (`ILV = 0`), line-interleaved
+//! (`ILV = 1`, DCMTK's default for colour) and sample-interleaved (`ILV = 2`).
+//! [`encode_image`] writes `ILV = 0`. Restart markers inside a scan are
+//! rejected as `Unsupported`; a `DRI` segment on its own is skipped. Verified
+//! against the T.87 conformance streams, CharLS and DCMTK output.
+//!
+//! The decoder also accepts what CharLS accepts from real-world encoders:
+//! `0x00` or `0xFF` padding before the next marker, LSE / COM / APPn segments
+//! between scans, an LSE `RESET` of 0 (the default), and a non-zero (reserved)
+//! SOF `Tq` or SOS `Ah`. An HP colour transform (APP8 `"mrfx"`) is rejected
+//! rather than decoded to the wrong colours.
 //!
 //! # Profiles
 //!
@@ -44,15 +51,18 @@ pub use error::CodecError;
 pub const TRANSFER_SYNTAX_UID: &str = "1.2.840.10008.1.2.4.80";
 
 /// Capability marker for this feature set — present in forks/releases that
-/// ship [`decode_image`] and 3-component planar (ILV 0) decoding, and absent
-/// from codecs that predate them.
+/// ship [`decode_image`], 3-component planar (ILV 0) decoding and line- /
+/// sample-interleaved (ILV 1 / 2) decoding, and absent from codecs that
+/// predate them.
 ///
-/// Downstreams that pull this crate through a temporary `[patch.crates-io]`
-/// override (pending an upstream release) can reference this constant in a
-/// build-time assertion or tripwire test, so the patch cannot be silently
-/// dropped back to a version without these capabilities. The value lists the
-/// capabilities, newest last.
-pub const FEATURE_CAPS: &str = "decode_image;rgb-ilv0-planar";
+/// Downstreams that pull this crate from a fork (pending an upstream release)
+/// should use a git dependency pinned to an exact `rev` — a
+/// `[patch.crates-io]` override applies only in the root manifest being built,
+/// not when this crate is a dependency of a library — and can reference this
+/// constant in a build-time assertion or tripwire test, so the dependency
+/// cannot silently resolve to a version without these capabilities. The value
+/// lists the capabilities, newest last.
+pub const FEATURE_CAPS: &str = "decode_image;rgb-ilv0-planar;ilv1-line;ilv2-sample";
 
 /// Bitstream profile selecting the entropy-coded scan format.
 ///
