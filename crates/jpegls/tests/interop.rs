@@ -16,49 +16,14 @@
 //! name as `...-nearN.jls`; the comparison then allows `|decoded - expected| ≤
 //! N` per sample instead of exact equality.
 
-use std::path::{Path, PathBuf};
+mod common;
+
+use std::path::PathBuf;
+
+use common::read_pnm;
 
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/interop")
-}
-
-fn read_pgm(path: &Path) -> (u32, u32, Vec<u16>) {
-    let d = std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-    assert_eq!(&d[..2], b"P5", "{}: not a P5 PGM", path.display());
-    let mut i = 2usize;
-    let mut toks = Vec::new();
-    while toks.len() < 3 {
-        while d[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        if d[i] == b'#' {
-            while d[i] != b'\n' {
-                i += 1;
-            }
-            continue;
-        }
-        let s = i;
-        while !d[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        toks.push(
-            std::str::from_utf8(&d[s..i])
-                .unwrap()
-                .parse::<u32>()
-                .unwrap(),
-        );
-    }
-    i += 1;
-    let (w, h, mv) = (toks[0], toks[1], toks[2]);
-    let px: Vec<u16> = if mv > 255 {
-        d[i..]
-            .chunks(2)
-            .map(|c| u16::from_be_bytes([c[0], c[1]]))
-            .collect()
-    } else {
-        d[i..].iter().map(|&b| b as u16).collect()
-    };
-    (w, h, px)
 }
 
 /// Parse an optional `-nearN` suffix from a stream stem.
@@ -92,7 +57,8 @@ fn decode_charls_fixtures() {
     for jls in streams {
         let stem = jls.file_stem().unwrap().to_str().unwrap().to_string();
         let pgm = dir.join(format!("{stem}.pgm"));
-        let (w, h, expected) = read_pgm(&pgm);
+        let reference = read_pnm(&pgm);
+        let (w, h, expected) = (reference.width, reference.height, reference.samples);
         let near = near_bound(&stem);
         let bytes = std::fs::read(&jls).unwrap();
         let (decoded, dw, dh) =
