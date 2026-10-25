@@ -51,6 +51,22 @@ fn clamp_threshold(i: i32, lo: i32, hi: i32) -> i32 {
     }
 }
 
+/// The smallest `k` with `n << k >= a` (T.87 A.5.1 / A.7.2.2), for `n >= 1`
+/// and `a >= 0` (0 when `n` is 0, as a guard): from the leading-zero counts,
+/// `n << k` reaches the bit length of `a`; one more doubling covers the rest.
+#[inline]
+fn golomb_k(n: i32, a: i32) -> i32 {
+    if n <= 0 {
+        return 0;
+    }
+    let k = (n.leading_zeros() as i32 - a.leading_zeros() as i32).max(0);
+    if (n << k) < a {
+        k + 1
+    } else {
+        k
+    }
+}
+
 /// Fold a signed context id into `(Q, sign)` (T.87 A.3.4): `Q` is its
 /// magnitude, `sign` is `-1` when it is negative.
 #[inline]
@@ -229,17 +245,9 @@ impl ContextModel {
 
     /// Compute the Golomb-Rice parameter `k` for a regular context `q`
     /// (T.87 A.5.1): smallest `k` with `N[Q] << k >= A[Q]`.
+    #[inline]
     pub fn compute_k(&self, q: usize) -> i32 {
-        let n = self.n[q];
-        if n == 0 {
-            return 0;
-        }
-        let a = self.a[q];
-        let mut k = 0i32;
-        while k < 31 && (n << k) < a {
-            k += 1;
-        }
-        k
+        golomb_k(self.n[q], self.a[q])
     }
 
     /// Update A/B/N (T.87 A.6.1, code segment A.12) then the bias C (A.6.2,
@@ -312,12 +320,7 @@ impl ContextModel {
         } else {
             self.a[RUN_CTX_BASE]
         };
-        let n = self.n[ctx];
-        let mut k = 0i32;
-        while k < 31 && (n << k) < temp {
-            k += 1;
-        }
-        k
+        golomb_k(self.n[ctx], temp)
     }
 
     /// Update run-interruption statistics (T.87 A.7.2, code segment A.23).
@@ -462,6 +465,22 @@ mod tests {
         assert_eq!(m.quantize_gradient(17), 3);
         assert_eq!(m.quantize_gradient(35), 4);
         assert_eq!(m.quantize_gradient(-35), -4);
+    }
+
+    #[test]
+    fn golomb_k_matches_the_doubling_loop() {
+        let looped = |n: i32, a: i32| {
+            let mut k = 0;
+            while k < 31 && (i64::from(n) << k) < i64::from(a) {
+                k += 1;
+            }
+            k
+        };
+        for n in (1..=200).chain([255, 256, 1000, 32767, 65535]) {
+            for a in (0..=4000).chain([65535, 1 << 20, (1 << 30) - 1, 1 << 30, i32::MAX]) {
+                assert_eq!(golomb_k(n, a), looped(n, a), "n {n} a {a}");
+            }
+        }
     }
 
     #[test]
