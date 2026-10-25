@@ -10,21 +10,24 @@ precision `2..=16`, for:
 
 - **Single-component** images (`Nf = 1`) — `encode` / `decode`, and
   `encode_image` / `decode_image`.
-- **3-component** images (e.g. RGB) — `decode_image`, in all three interleave
-  modes: one scan per component (`ILV = 0`), one line-interleaved scan
-  (`ILV = 1`, DCMTK's default for colour) or one sample-interleaved scan
-  (`ILV = 2`). `encode_image` writes `ILV = 0`, for any component count.
+- **Multi-component** images (1 to 255 components, e.g. RGB, RGBA) —
+  `decode_image`, in all three interleave modes: one scan per component
+  (`ILV = 0`), line-interleaved scans (`ILV = 1`, DCMTK's default for colour)
+  or sample-interleaved scans (`ILV = 2`), up to four components per scan and
+  in any mix across the frame. Scans are placed by their component selectors
+  (falling back to frame order when those are unusable, as CharLS ignores
+  them). `encode_image` writes `ILV = 0`, for any component count.
 
 Rejected as `Unsupported`: restart markers inside a scan (`RSTn`), LSE mapping
-tables, component subsampling, a scan covering only some of the remaining
-components (mixed interleave), NEAR differing between scans, and HP colour
+tables, component subsampling, NEAR differing between scans, and HP colour
 transforms. Rejected as `InvalidData`: a non-zero point transform, an
 impossible scan component count, or an interleave mode that does not fit it.
 A `DRI` segment on its own is tolerated and skipped.
 
 Interop is verified bit-exactly against the **ITU-T T.87 conformance**
-streams (HP encoder), **CharLS** test streams and **DCMTK** (`dcmcjpls`)
-output — see `tests/fixtures/`.
+streams (HP encoder), **CharLS** test streams and CharLS-encoded images
+(four components, SPIFF headers, presets), and **DCMTK** (`dcmcjpls`) output
+— see `tests/fixtures/`.
 
 ### Compatibility notes
 
@@ -47,6 +50,13 @@ is used as written (CharLS truncates it to 8 bits), and an LSE `MAXVAL` sets
 `RANGE` / `LIMIT` / `qbpp` (CharLS derives those from the sample precision).
 DCMTK never writes either case.
 
+A caution for producers rather than a decoder rule: CharLS releases built before
+commit 3790e10 (April 2023; e.g. the CharLS 2.4 inside pillow-jpls 1.3.2) are
+not lossless for **four-component, sample-interleaved** images — a pixel that
+differs from its left neighbour only in the 4th component (e.g. alpha) is coded
+as part of a run, and that change is lost. Every decoder, this one included,
+reproduces the stream as written.
+
 ### Profiles
 
 - `Profile::T87` (default) — ITU-T T.87 conformant output.
@@ -62,8 +72,8 @@ Near-lossless and explicit precision are set through `EncodeOptions` via
 - **Context-based adaptive prediction** with Median Edge Detection (MED)
 - **Golomb-Rice entropy coding** with adaptive parameter selection
 - **Run-length mode** for efficient coding of uniform regions
-- **Grayscale and 3-component** (e.g. RGB) images in every interleave mode,
-  precision `2..=16`
+- **Grayscale and multi-component** (e.g. RGB, RGBA) images in every
+  interleave mode, precision `2..=16`
 - **DICOS/DICOM compatible**: Transfer Syntax `1.2.840.10008.1.2.4.80`
 - **Pure Rust**: No external codec dependencies
 
@@ -156,7 +166,7 @@ selection, allowing the codec to adapt to local image characteristics.
 | Pixel Type | Precision | Components | Description |
 |------------|-----------|------------|-------------|
 | `u16` | `2..=16` bits | 1 (`Nf = 1`, `ILV = 0`) | single-component grayscale |
-| `u16` | `2..=16` bits | 3 (`Nf = 3`, `ILV = 0/1/2`) | multi-component, e.g. RGB; decoded to planar samples (`encode_image` writes `ILV = 0`, any `Nf`) |
+| `u16` | `2..=16` bits | 2-255 (`ILV = 0/1/2`, mixed) | multi-component, e.g. RGB, RGBA; decoded to planar samples (`encode_image` writes `ILV = 0`, any `Nf`) |
 
 ## JPEG-LS Stream Format
 
@@ -169,8 +179,8 @@ LSE   - JPEG-LS Preset Parameters (0xFFF8, optional)
 SOS   - Start of Scan (0xFFDA)
         Component selector(s), Near parameter (0 = lossless), ILV
 [entropy-coded image data]
-(ILV = 0 multi-component: SOS + scan repeat once per component;
- ILV = 1/2: one SOS + scan covers every component)
+(multi-component: SOS + scan repeat until every component is covered —
+ one component per ILV = 0 scan, up to four per ILV = 1/2 scan)
 EOI   - End of Image (0xFFD9)
 ```
 

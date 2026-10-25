@@ -40,6 +40,11 @@ const MIN_RESET: i32 = 3;
 /// Most components one scan may carry (T.87 C.2.3: `1 <= Ns <= 4`).
 const MAX_SCAN_COMPONENTS: usize = 4;
 
+/// Hard cap on decoded samples over all components (`width*height*Nf`): three
+/// full-size planes, the largest allocation 3-component images could make
+/// before frames of up to 255 components were accepted.
+const MAX_SAMPLES: usize = 3 * MAX_PIXELS;
+
 // ---------------------------------------------------------------------------
 // Frame / scan headers + LSE presets
 // ---------------------------------------------------------------------------
@@ -49,8 +54,7 @@ struct FrameHeader {
     precision: u32,
     height: usize,
     width: usize,
-    /// Number of components (Nf). 1 (grayscale) or 3 (e.g. RGB); other counts
-    /// are rejected in [`Decoder::read_sof`].
+    /// Number of components (Nf, `1..=255`).
     components: usize,
 }
 
@@ -61,6 +65,8 @@ struct ScanHeader {
     components: usize,
     /// Interleave mode: 0 (one component), 1 (line) or 2 (sample).
     ilv: u8,
+    /// Component selectors `Csj`; the first `components` are meaningful.
+    selectors: [u8; MAX_SCAN_COMPONENTS],
 }
 
 /// LSE ID=1 coding-parameter presets (T.87 C.2.4.1.1); `None` = spec default.
@@ -76,6 +82,8 @@ struct Presets {
 /// Everything parsed up to and including the first SOS.
 struct Header {
     frame: FrameHeader,
+    /// SOF55 component identifiers `Ci`, in frame order.
+    component_ids: Vec<u8>,
     presets: Presets,
     scan: ScanHeader,
 }
@@ -107,10 +115,9 @@ pub fn decode_with_options(
 
 /// A decoded JPEG-LS image with the frame metadata a DICOM caller needs.
 ///
-/// Supports grayscale (`components == 1`) and 3-component frames, coded as
-/// one scan per component (ILV 0) or as a single line- (ILV 1) or
-/// sample-interleaved (ILV 2) scan. The samples are component-planar whatever
-/// the interleave mode.
+/// Supports frames of 1 to 255 components, each scan coding one component
+/// (ILV 0) or up to four line- (ILV 1) or sample-interleaved (ILV 2). The
+/// samples are component-planar whatever the interleave mode.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodedImage {
     /// Samples in component-planar order — all of component 0, then component
@@ -122,10 +129,11 @@ pub struct DecodedImage {
     pub height: u32,
     /// Sample precision in bits (2..=16).
     pub bits_per_sample: u8,
-    /// Component count (1 or 3).
+    /// Component count (`1..=255`), in SOF55 order.
     pub components: u8,
-    /// Interleave mode of the (first) scan: `0` none, `1` line, `2` sample.
-    /// Informational only: [`Self::samples`] is planar in every mode.
+    /// Interleave mode of the first scan: `0` none, `1` line, `2` sample
+    /// (later scans may differ). Informational only: [`Self::samples`] is
+    /// planar in every mode.
     pub interleave_mode: u8,
     /// NEAR error bound (0 = lossless).
     pub near: u8,
@@ -134,7 +142,7 @@ pub struct DecodedImage {
 /// Decode a JPEG-LS bitstream, reading the geometry from the codestream.
 ///
 /// Unlike [`decode`], this takes no expected dimensions and returns the full
-/// frame metadata in [`DecodedImage`], including 3-component frames in any
+/// frame metadata in [`DecodedImage`], for any component count and
 /// interleave mode. T.87 conformant path only (no `LegacyGo`).
 pub fn decode_image(data: &[u8]) -> Result<DecodedImage, CodecError> {
     let mut dec = Decoder::new(data);
@@ -230,11 +238,13 @@ impl<'a> Decoder<'a> {
     /// Read marker segments up to and including the next SOS, applying SOF55,
     /// LSE and APP8 as they come and skipping DRI, COM and the other APPn.
     ///
-    /// Used before the first scan (`frame` still `None`) and between scans,
-    /// where `done` components have already been decoded.
+    /// Used before the first scan (`frame` still `None`; SOF55 fills it and
+    /// `component_ids`) and between scans, where `done` components have
+    /// already been decoded.
     fn read_segments(
         &mut self,
         frame: &mut Option<FrameHeader>,
+        component_ids: &mut Vec<u8>,
         presets: &mut Presets,
         done: usize,
     ) -> Result<ScanHeader, CodecError> {
@@ -245,7 +255,9 @@ impl<'a> Decoder<'a> {
                     if frame.is_some() {
                         return Err(CodecError::InvalidData("duplicate SOF55 marker".into()));
                     }
-                    *frame = Some(self.read_sof(length)?);
+                    let (header, ids) = self.read_sof(length)?;
+                    *frame = Some(header);
+                    *component_ids = ids;
                 }
                 MARKER_LSE => self.read_lse(length, presets)?,
                 MARKER_APP8 => self.read_app8(length)?,
@@ -279,7 +291,8 @@ impl<'a> Decoder<'a> {
         }
     }
 
-    fn read_sof(&mut self, payload_len: usize) -> Result<FrameHeader, CodecError> {
+    /// Parse SOF55, returning the frame header and the component ids `Ci`.
+    fn read_sof(&mut self, payload_len: usize) -> Result<(FrameHeader, Vec<u8>), CodecError> {
         let p = self.read_byte()?;
         if !(2..=16).contains(&p) {
             return Err(CodecError::InvalidParameter {
@@ -312,22 +325,29 @@ impl<'a> Decoder<'a> {
         }
 
         let nf = self.read_byte()?;
-        // Grayscale (1) and 3-component (e.g. RGB) frames are supported. The
-        // single-scan `decode()` entry remains grayscale-only (it re-checks
-        // below); `decode_image()` handles 3-component frames.
-        if nf != 1 && nf != 3 {
-            return Err(CodecError::Unsupported(format!(
-                "JPEG-LS component count {nf} not supported (only 1 or 3)"
-            )));
+        // Any component count T.87 allows (1..=255). The single-scan `decode()`
+        // entry remains grayscale-only (it re-checks below).
+        if nf == 0 {
+            return Err(CodecError::InvalidData(
+                "SOF55 component count must be non-zero".into(),
+            ));
+        }
+        let samples = width * height * usize::from(nf);
+        if samples > MAX_SAMPLES {
+            return Err(CodecError::InvalidParameter {
+                name: "width*height*components",
+                value: samples as i64,
+                allowed: "product <= 805306368 samples (3<<28)",
+            });
         }
 
         // Component specs: [Ci, sampling (Hi<<4 | Vi), Tqi] per component.
         // Require 1:1 sampling (no subsampling); otherwise the scan would be
         // mis-decoded. Tqi is reserved in JPEG-LS and ignored, as CharLS does
-        // (mapping tables are selected per scan, in SOS). The component id Ci
-        // is not checked.
+        // (mapping tables are selected per scan, in SOS).
+        let mut ids = Vec::with_capacity(usize::from(nf));
         for _ in 0..nf {
-            let _ci = self.read_byte()?;
+            ids.push(self.read_byte()?);
             let sampling = self.read_byte()?;
             let _tq = self.read_byte()?;
             if sampling != 0x11 {
@@ -342,12 +362,13 @@ impl<'a> Decoder<'a> {
             self.skip(payload_len - consumed)?;
         }
 
-        Ok(FrameHeader {
+        let header = FrameHeader {
             precision: u32::from(p),
             height,
             width,
             components: nf as usize,
-        })
+        };
+        Ok((header, ids))
     }
 
     /// Parse an LSE segment. Only ID=1 (coding parameters) is supported.
@@ -449,12 +470,13 @@ impl<'a> Decoder<'a> {
                 2 * ns + 6
             )));
         }
-        // Component spec: [Csj, mapping-table selector]. The component selector
-        // Csj is not checked (CharLS ignores it); a non-zero mapping-table
-        // selector references an LSE mapping table this decoder does not apply,
-        // so reject it rather than silently mis-decode.
-        for _ in 0..ns {
-            let _csj = self.read_byte()?;
+        // Component spec: [Csj, mapping-table selector]. Csj places the
+        // component (see `scan_targets`); a non-zero mapping-table selector
+        // references an LSE mapping table this decoder does not apply, so
+        // reject it rather than silently mis-decode.
+        let mut selectors = [0u8; MAX_SCAN_COMPONENTS];
+        for selector in &mut selectors[..ns] {
+            *selector = self.read_byte()?;
             let mapping = self.read_byte()?;
             if mapping != 0 {
                 return Err(CodecError::Unsupported(format!(
@@ -479,14 +501,6 @@ impl<'a> Decoder<'a> {
                 "SOS interleave mode ILV = {ilv} is invalid for Ns = {ns}"
             )));
         }
-        // A multi-component scan that leaves frame components for a later scan
-        // (mixed interleave) is legal but not supported yet.
-        if ns > 1 && remaining.is_some_and(|r| ns < r) {
-            return Err(CodecError::Unsupported(format!(
-                "partial multi-component scan (Ns = {ns} of {} remaining) not supported",
-                remaining.unwrap_or(ns)
-            )));
-        }
         // Point transform Al (the low nibble) must be 0: a non-zero value
         // shifts the samples, which this decoder does not apply. Ah has no
         // meaning in JPEG-LS and is ignored, as CharLS does.
@@ -501,6 +515,7 @@ impl<'a> Decoder<'a> {
             near: i32::from(near),
             components: ns,
             ilv,
+            selectors,
         })
     }
 
@@ -531,11 +546,13 @@ impl<'a> Decoder<'a> {
     fn read_header(&mut self) -> Result<Header, CodecError> {
         self.expect_marker(MARKER_SOI)?;
         let mut frame: Option<FrameHeader> = None;
+        let mut component_ids = Vec::new();
         let mut presets = Presets::default();
-        let scan = self.read_segments(&mut frame, &mut presets, 0)?;
+        let scan = self.read_segments(&mut frame, &mut component_ids, &mut presets, 0)?;
         let frame = frame.ok_or_else(|| CodecError::InvalidData("missing SOF55 marker".into()))?;
         Ok(Header {
             frame,
+            component_ids,
             presets,
             scan,
         })
@@ -590,19 +607,23 @@ impl<'a> Decoder<'a> {
     /// Decode every scan of the frame (the first SOS is already parsed) into
     /// component-planar samples, then check the trailing EOI. T.87 path only.
     ///
+    /// The scans may interleave differently (one component per scan, or up
+    /// to four line- or sample-interleaved), as long as together they cover
+    /// every component once; [`scan_targets`] places each scan's components.
     /// LSE, DRI, COM and APPn segments may sit between scans (CharLS reads
     /// them too); an LSE there applies to the scans that follow.
     fn decode_frame(&mut self, header: Header) -> Result<DecodedImage, CodecError> {
         let Header {
             frame,
+            component_ids,
             mut presets,
             scan: first,
         } = header;
         let (w, h, nf) = (frame.width, frame.height, frame.components);
-        // w*h*nf cannot overflow: read_sof caps w*h at MAX_PIXELS (1<<28) and
-        // nf <= 3.
+        // w*h*nf cannot overflow: read_sof caps it at MAX_SAMPLES.
         let plane = w * h;
         let mut samples = vec![0u16; plane * nf];
+        let mut decoded = vec![false; nf];
 
         let mut scan = first;
         let mut done = 0usize;
@@ -620,23 +641,41 @@ impl<'a> Decoder<'a> {
                 max_val, scan.near, reset, presets.t1, presets.t2, presets.t3,
             );
             let ns = scan.components;
+            let targets = scan_targets(&component_ids, &decoded, &scan.selectors[..ns]);
+            // Usually the scan's components are consecutive in the frame and
+            // decode straight into their planes; otherwise via a scratch buffer.
+            let first_target = targets[0];
+            let in_place = targets.iter().zip(first_target..).all(|(&t, i)| t == i);
+            let mut scratch = Vec::new();
+            let planes = if in_place {
+                &mut samples[first_target * plane..(first_target + ns) * plane]
+            } else {
+                scratch.resize(ns * plane, 0u16);
+                &mut scratch[..]
+            };
             let scan_start = self.pos;
             let consumed = decode_scan_t87(
                 &self.data[scan_start..],
-                &mut samples[done * plane..(done + ns) * plane],
+                planes,
                 w,
                 h,
                 scan.ilv,
                 ctx,
                 scan_start,
             )?;
+            for (&t, src) in targets.iter().zip(scratch.chunks_exact(plane)) {
+                samples[t * plane..(t + 1) * plane].copy_from_slice(src);
+            }
+            for &t in &targets {
+                decoded[t] = true;
+            }
             self.pos = scan_start + consumed;
             done += ns;
             if done == nf {
                 break;
             }
             self.skip_zero_padding();
-            scan = self.read_segments(&mut Some(frame), &mut presets, done)?;
+            scan = self.read_segments(&mut Some(frame), &mut Vec::new(), &mut presets, done)?;
         }
         self.expect_eoi()?;
 
@@ -649,6 +688,38 @@ impl<'a> Decoder<'a> {
             interleave_mode: first.ilv,
             near: first.near as u8,
         })
+    }
+}
+
+/// The frame component (plane index) each of a scan's components decodes into.
+///
+/// When every selector `Csj` names a distinct SOF component that no earlier
+/// scan decoded, the scan goes where its selectors say (T.87 C.2.3), so scans
+/// may come in any order. Otherwise — an unknown, repeated or already used
+/// selector, or duplicate SOF ids — it takes the next undecoded components in
+/// frame order: CharLS ignores the selectors altogether, so streams with
+/// arbitrary ones decode there and must decode here too.
+fn scan_targets(component_ids: &[u8], decoded: &[bool], selectors: &[u8]) -> Vec<usize> {
+    let by_selector: Option<Vec<usize>> = selectors
+        .iter()
+        .map(|&cs| {
+            let mut matches = component_ids
+                .iter()
+                .enumerate()
+                .filter(|&(_, &id)| id == cs)
+                .map(|(i, _)| i);
+            match (matches.next(), matches.next()) {
+                (Some(i), None) if !decoded[i] => Some(i),
+                _ => None,
+            }
+        })
+        .collect();
+    match by_selector {
+        Some(t) if t.iter().enumerate().all(|(k, i)| !t[..k].contains(i)) => t,
+        _ => (0..decoded.len())
+            .filter(|&i| !decoded[i])
+            .take(selectors.len())
+            .collect(),
     }
 }
 
@@ -1372,12 +1443,109 @@ mod tests {
                 other => panic!("Nf {nf} Ns {ns} ILV {ilv}: {other:?}"),
             }
         }
-        // A multi-component scan that leaves components for a later scan
-        // (mixed interleave) is legal, but not supported.
+    }
+
+    #[test]
+    fn sof_component_count_and_sample_cap() {
+        let sof = |w: u16, h: u16, nf: u8| {
+            let mut out: Vec<u8> = vec![0xFF, 0xD8, 0xFF, 0xF7];
+            out.extend_from_slice(&(8 + 3 * u16::from(nf)).to_be_bytes());
+            out.push(8);
+            out.extend_from_slice(&h.to_be_bytes());
+            out.extend_from_slice(&w.to_be_bytes());
+            out.push(nf);
+            for c in 1..=nf {
+                out.extend_from_slice(&[c, 0x11, 0x00]);
+            }
+            out
+        };
         assert!(matches!(
-            decode_image(&sos_header_stream(3, 2, 1, 0)),
-            Err(CodecError::Unsupported(_))
+            decode_image(&sof(4, 4, 0)),
+            Err(CodecError::InvalidData(_))
         ));
+        // 16384 x 16384 is allowed per plane (1<<28), but four such planes
+        // exceed the total-sample cap.
+        assert!(matches!(
+            decode_image(&sof(16384, 16384, 4)),
+            Err(CodecError::InvalidParameter {
+                name: "width*height*components",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn planar_round_trips_any_component_count() {
+        let (w, h) = (7u32, 5u32);
+        for comps in [2u8, 4, 5] {
+            let planar: Vec<u16> = (0..w * h * u32::from(comps))
+                .map(|i| ((i * 29 + i / 35 * 7) % 256) as u16)
+                .collect();
+            let mut buf = Vec::new();
+            encode_image(&planar, w, h, comps, &EncodeOptions::default(), &mut buf).unwrap();
+            let img = decode_image(&buf).unwrap_or_else(|e| panic!("{comps} components: {e}"));
+            assert_eq!((img.components, img.interleave_mode), (comps, 0));
+            assert_eq!(img.samples, planar, "{comps} components");
+        }
+    }
+
+    /// Split a stream into the bytes before its first SOS and one chunk per
+    /// scan (SOS segment + entropy data), dropping EOI and any 0xFF fill
+    /// before it. Assumes nothing else sits between the scans.
+    fn split_scans(stream: &[u8]) -> (Vec<u8>, Vec<Vec<u8>>) {
+        let starts: Vec<usize> = stream
+            .windows(2)
+            .enumerate()
+            .filter(|(_, p)| *p == [0xFF, 0xDA])
+            .map(|(i, _)| i)
+            .collect();
+        let mut end = stream.len() - 2;
+        while stream[end - 1] == 0xFF {
+            end -= 1;
+        }
+        let scans = starts
+            .iter()
+            .enumerate()
+            .map(|(k, &s)| stream[s..starts.get(k + 1).copied().unwrap_or(end)].to_vec())
+            .collect();
+        (stream[..starts[0]].to_vec(), scans)
+    }
+
+    #[test]
+    fn scans_are_placed_by_their_selectors() {
+        // Scans may come in any order; Csj says which component each one is.
+        let planes: Vec<Vec<u16>> = (0..3u16)
+            .map(|c| (0..20).map(|i| (i * 11 + c * 60) % 256).collect())
+            .collect();
+        let rgb = build_planar_rgb(&planes, 5, 4, 8);
+        let (head, scans) = split_scans(&rgb);
+        let mut reordered = head;
+        for k in [2, 0, 1] {
+            reordered.extend_from_slice(&scans[k]);
+        }
+        reordered.extend_from_slice(&[0xFF, 0xD9]);
+        assert_eq!(decode_image(&reordered).unwrap().samples, planes.concat());
+    }
+
+    #[test]
+    fn unusable_selectors_fall_back_to_frame_order() {
+        // CharLS ignores Csj, so streams whose selectors name no component, or
+        // the same component in every scan, decode in scan order.
+        let planes: Vec<Vec<u16>> = (0..3u16)
+            .map(|c| (0..20).map(|i| (i * 7 + c * 45) % 256).collect())
+            .collect();
+        let rgb = build_planar_rgb(&planes, 5, 4, 8);
+        for selector in [9u8, 1] {
+            let mut patched = rgb.clone();
+            for k in 0..3 {
+                patched[nth_marker(&rgb, 0xDA, k) + 5] = selector;
+            }
+            assert_eq!(
+                decode_image(&patched).unwrap().samples,
+                planes.concat(),
+                "selector {selector}"
+            );
+        }
     }
 
     #[test]

@@ -11,8 +11,8 @@
 //! allowed — and checks the result against the rules the encoder documents:
 //!
 //! - the encoder accepts exactly the requests the oracle calls valid;
-//! - an accepted request decodes back (within ±NEAR) when the decoder supports
-//!   its component count, and is rejected as `Unsupported` when it does not;
+//! - an accepted request decodes back (within ±NEAR), whatever its component
+//!   count;
 //! - a writer that fails after a fuzz-chosen fraction of the output turns into
 //!   `CodecError::Io` when the output does not fit, and changes nothing when
 //!   it does.
@@ -184,7 +184,7 @@ fuzz_target!(|data: &[u8]| {
         let (decoded, _, _) = jpegls::decode_with_options(&stream, width, height, &dopts)
             .expect("LegacyGo decode rejected LegacyGo encode output");
         assert_eq!(decoded, pixels, "LegacyGo round-trip changed samples");
-    } else if comps == 1 || comps == 3 {
+    } else {
         let img = jpegls::decode_image(&stream).expect("decode_image rejected encoder output");
         assert_eq!(
             (img.width, img.height, img.components, img.near),
@@ -193,14 +193,6 @@ fuzz_target!(|data: &[u8]| {
         );
         assert_eq!(Some(img.bits_per_sample), effective);
         assert_within_near(&img.samples, &pixels, opts.near);
-    } else {
-        assert!(
-            matches!(
-                jpegls::decode_image(&stream),
-                Err(CodecError::Unsupported(_))
-            ),
-            "a {comps}-component stream should be Unsupported by the decoder"
-        );
     }
 
     // ---- a writer that fails part-way ----

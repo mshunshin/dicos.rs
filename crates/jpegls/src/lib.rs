@@ -5,12 +5,13 @@
 //!
 //! # Conformance scope
 //!
-//! Conformant T.87 for **single-component** images and **3-component** images
-//! (e.g. RGB) through [`decode_image`], precision `2..=16`, with LSE ID=1
-//! presets, run mode, and near-lossless. The decoder reads all three
-//! interleave modes: one scan per component (`ILV = 0`), line-interleaved
-//! (`ILV = 1`, DCMTK's default for colour) and sample-interleaved (`ILV = 2`).
-//! [`encode_image`] writes `ILV = 0`. Restart markers inside a scan are
+//! Conformant T.87 for **single-component** and **multi-component** images
+//! (1 to 255 components, e.g. RGB or RGBA) through [`decode_image`], precision
+//! `2..=16`, with LSE ID=1 presets, run mode, and near-lossless. The decoder
+//! reads all three interleave modes — one scan per component (`ILV = 0`),
+//! line-interleaved (`ILV = 1`, DCMTK's default for colour) and
+//! sample-interleaved (`ILV = 2`, up to four components per scan) — and any
+//! mix of them across a frame's scans. [`encode_image`] writes `ILV = 0`. Restart markers inside a scan are
 //! rejected as `Unsupported`; a `DRI` segment on its own is skipped. Verified
 //! against the T.87 conformance streams, CharLS and DCMTK output.
 //!
@@ -51,9 +52,9 @@ pub use error::CodecError;
 pub const TRANSFER_SYNTAX_UID: &str = "1.2.840.10008.1.2.4.80";
 
 /// Capability marker for this feature set — present in forks/releases that
-/// ship [`decode_image`], 3-component planar (ILV 0) decoding and line- /
-/// sample-interleaved (ILV 1 / 2) decoding, and absent from codecs that
-/// predate them.
+/// ship [`decode_image`], 3-component planar (ILV 0) decoding, line- /
+/// sample-interleaved (ILV 1 / 2) decoding, any component count and mixed
+/// interleave across scans, and absent from codecs that predate them.
 ///
 /// Downstreams that pull this crate from a fork (pending an upstream release)
 /// should use a git dependency pinned to an exact `rev` — a
@@ -62,7 +63,8 @@ pub const TRANSFER_SYNTAX_UID: &str = "1.2.840.10008.1.2.4.80";
 /// constant in a build-time assertion or tripwire test, so the dependency
 /// cannot silently resolve to a version without these capabilities. The value
 /// lists the capabilities, newest last.
-pub const FEATURE_CAPS: &str = "decode_image;rgb-ilv0-planar;ilv1-line;ilv2-sample";
+pub const FEATURE_CAPS: &str =
+    "decode_image;rgb-ilv0-planar;ilv1-line;ilv2-sample;nf-any;mixed-ilv";
 
 /// Bitstream profile selecting the entropy-coded scan format.
 ///
