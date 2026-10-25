@@ -7,7 +7,7 @@
 use std::ops::Range;
 
 use crate::bitstream::BitReader;
-use crate::context::ContextModel;
+use crate::context::{split_context_id, ContextModel};
 use crate::error::CodecError;
 use crate::predictor::{clamp, predict_med};
 use crate::run_mode;
@@ -1190,7 +1190,6 @@ fn decode_line(
     base_offset: usize,
 ) -> Result<(), CodecError> {
     let width = out_row.len();
-    let near = ctx.near;
     cur[0] = prev[1];
     prev[width + 1] = prev[width];
 
@@ -1201,7 +1200,9 @@ fn decode_line(
         let rc = prev[x];
         let rd = prev[x + 2];
 
-        if (rd - rb).abs() <= near && (rb - rc).abs() <= near && (rc - ra).abs() <= near {
+        // All three gradients within NEAR <=> context id 0: run mode.
+        let qs = ctx.context_id(rd - rb, rb - rc, rc - ra);
+        if qs == 0 {
             let before = x;
             x = match run_mode::decode_run(br, ctx, cur, prev, x, width) {
                 Ok(v) => v,
@@ -1213,7 +1214,7 @@ fn decode_line(
             continue;
         }
 
-        let recon = decode_regular(br, ctx, [ra, rb, rc, rd], base_offset)?;
+        let recon = decode_regular(br, ctx, qs, [ra, rb, rc], base_offset)?;
         cur[x + 1] = recon;
         out_row[x] = recon as u16;
         x += 1;
@@ -1236,19 +1237,19 @@ fn decode_line_sample(
     width: usize,
     base_offset: usize,
 ) -> Result<(), CodecError> {
-    let near = ctx.near;
     for (above, line) in prev.iter_mut().zip(cur.iter_mut()) {
         line[0] = above[1];
         above[width + 1] = above[width];
     }
 
     let mut x = 0usize;
+    let mut ids = [0i32; MAX_SCAN_COMPONENTS];
     while x < width {
-        let flat = prev.iter().zip(cur.iter()).all(|(above, line)| {
+        for ((id, above), line) in ids.iter_mut().zip(prev.iter()).zip(cur.iter()) {
             let (ra, rb, rc, rd) = (line[x], above[x + 1], above[x], above[x + 2]);
-            (rd - rb).abs() <= near && (rb - rc).abs() <= near && (rc - ra).abs() <= near
-        });
-        if flat {
+            *id = ctx.context_id(rd - rb, rb - rc, rc - ra);
+        }
+        if ids[..prev.len()].iter().all(|&qs| qs == 0) {
             x = match run_mode::decode_run_sample(br, ctx, cur, prev, x, width) {
                 Ok(v) => v,
                 Err(e) => return Err(scan_error(e, base_offset + br.pos())),
@@ -1256,26 +1257,28 @@ fn decode_line_sample(
             continue;
         }
 
-        for (above, line) in prev.iter().zip(cur.iter_mut()) {
-            let neighbours = [line[x], above[x + 1], above[x], above[x + 2]];
-            line[x + 1] = decode_regular(br, ctx, neighbours, base_offset)?;
+        for ((&qs, above), line) in ids.iter().zip(prev.iter()).zip(cur.iter_mut()) {
+            let neighbours = [line[x], above[x + 1], above[x]];
+            line[x + 1] = decode_regular(br, ctx, qs, neighbours, base_offset)?;
         }
         x += 1;
     }
     Ok(())
 }
 
-/// Decode one regular-mode sample (T.87 A.4-A.6) from its causal neighbours
-/// `[Ra, Rb, Rc, Rd]` and return the reconstructed value.
+/// Decode one regular-mode sample (T.87 A.4-A.6) with signed context id `qs`
+/// (see [`ContextModel::context_id`]) from its causal neighbours
+/// `[Ra, Rb, Rc]`, and return the reconstructed value.
 #[inline(always)]
 fn decode_regular(
     br: &mut BitReader<'_>,
     ctx: &mut ContextModel,
-    [ra, rb, rc, rd]: [i32; 4],
+    qs: i32,
+    [ra, rb, rc]: [i32; 3],
     base_offset: usize,
 ) -> Result<i32, CodecError> {
     let (near, max_val, range) = (ctx.near, ctx.max_val, ctx.range);
-    let (q, sign) = ctx.get_context_index(rd - rb, rb - rc, rc - ra);
+    let (q, sign) = split_context_id(qs);
     let k = ctx.compute_k(q);
     let mut px = predict_med(ra, rb, rc);
     px += sign * ctx.c[q];
