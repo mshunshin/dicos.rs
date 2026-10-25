@@ -59,7 +59,9 @@ stream that decodes under T.87 is never reinterpreted:
 - **CharLS's LSE MAXVAL**: CharLS derives `RANGE`, `LIMIT` and `qbpp` from the
   sample precision and uses an LSE `MAXVAL` only for the default thresholds,
   where T.87 derives all of them from `MAXVAL`. Any CharLS stream with an LSE
-  `MAXVAL` below `2^P - 1` is coded this way.
+  `MAXVAL` below `2^P - 1` is coded this way. Decoded as CharLS does, a
+  near-lossless sample may exceed `MAXVAL` by up to `NEAR`; a reading with any
+  sample beyond that is rejected, since no CharLS encoder produces one.
 
 Where CharLS departs from T.87 in a way that cannot be told apart, the decoder
 follows T.87: a `RESET` above 255 is used as written (CharLS truncates it to 8

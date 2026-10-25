@@ -757,6 +757,20 @@ impl<'a> Decoder<'a> {
                 segments.restart_interval,
                 scan_start,
             )?;
+            if coding == Coding::CharLsMaxval {
+                // A CharLS encoder keeps every reconstructed sample within NEAR
+                // of a source sample no larger than MAXVAL. Anything beyond
+                // that is not a CharLS stream, so this reading is rejected.
+                let sof_max_val = (1i32 << frame.precision) - 1;
+                let max_val = segments.presets.maxval.unwrap_or(sof_max_val);
+                let limit = (max_val + scan.near).min(sof_max_val);
+                if planes.iter().any(|&s| i32::from(s) > limit) {
+                    return Err(CodecError::InvalidData(format!(
+                        "samples above MAXVAL {max_val} + NEAR {} under CharLS coding",
+                        scan.near
+                    )));
+                }
+            }
             for (&t, src) in targets.iter().zip(scratch.chunks_exact(plane)) {
                 samples[t * plane..(t + 1) * plane].copy_from_slice(src);
             }
@@ -2174,6 +2188,22 @@ mod tests {
                 pixels,
                 "P {precision} T.87"
             );
+        }
+    }
+
+    #[test]
+    fn charls_maxval_retry_rejects_out_of_range_samples() {
+        // Samples up to 255 coded CharLS-style under an LSE MAXVAL of 100: no
+        // CharLS encoder produces that, so the retry must not accept it and
+        // hand back samples above MAXVAL (found by fuzzing `decode_lse`).
+        let (w, h) = (48usize, 32usize);
+        let pixels = textured(w, h, 255);
+        let (t1, t2, t3) = ContextModel::default_thresholds(100, 0);
+        let ctx = ContextModel::with_presets(255, 0, DEFAULT_RESET, Some(t1), Some(t2), Some(t3));
+        let s = stream_with_ctx(8, &pixels, w, h, Some([100, 0, 0, 0, 0]), ctx);
+        match decode_image(&s) {
+            Err(_) => {}
+            Ok(img) => assert!(img.samples.iter().all(|&v| v <= 100), "sample above MAXVAL"),
         }
     }
 
