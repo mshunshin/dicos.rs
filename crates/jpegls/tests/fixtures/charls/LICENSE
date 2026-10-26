@@ -7,7 +7,8 @@ BSD 3-Clause License below.
   Copyright (c) Hewlett-Packard Company 1995-1999
 
 - banny*.jls, banny.ppm, fuzzy*.jls, no_start_byte_after_encoded_scan.jls,
-  8bit-monochrome-2x2.jls -- CharLS test data:
+  8bit-monochrome-2x2.jls, test8_ilv_*_rm_*.jls, test16_rm_5.jls -- CharLS
+  test data:
   Copyright (c) 2024 Team CharLS
   Copyright (c) 2007, Jan de Vaan and Victor Derks
 

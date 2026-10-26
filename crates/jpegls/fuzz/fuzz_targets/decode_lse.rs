@@ -12,10 +12,12 @@
 //! finding:
 //!
 //! - the [`jpegls::DecodedImage`] contract, with no sample above the
-//!   *effective* MAXVAL (the preset's, when it sets one);
+//!   *effective* MAXVAL (the preset's, when it sets one) — plus NEAR when that
+//!   preset is below `2^P - 1`, where the CharLS-coding retry may apply;
 //! - the frame and scan fields come back as written;
 //! - the accepted preset obeys the rules the decoder documents: MAXVAL within
-//!   the SOF precision, RESET >= 3, NEAR <= min(255, MAXVAL/2);
+//!   the SOF precision, RESET 0 (the default) or `3..=max(255, MAXVAL)`,
+//!   NEAR <= min(255, MAXVAL/2);
 //! - a single-component stream decodes identically through `jpegls::decode`.
 //!
 //! Input layout (missing bytes read as 0):
@@ -131,12 +133,25 @@ fuzz_target!(|data: &[u8]| {
         effective_max <= sof_max,
         "accepted LSE MAXVAL {maxval} above 2^{precision} - 1"
     );
-    assert!(reset >= 3, "accepted LSE RESET {reset} < 3");
+    // RESET 0 selects the default (T.87 C.2.4.1.1, as CharLS reads it);
+    // otherwise it must lie in 3..=max(255, MAXVAL).
+    assert!(
+        reset == 0 || (3..=effective_max.max(255)).contains(&u32::from(reset)),
+        "accepted LSE RESET {reset} outside 0 or 3..=max(255, MAXVAL {effective_max})"
+    );
     assert!(
         u32::from(near) <= (effective_max / 2).min(255),
         "accepted NEAR {near} above min(255, MAXVAL/2) for MAXVAL {effective_max}"
     );
-    assert_image_contract(&img, Some(effective_max));
+    // A preset MAXVAL below 2^P - 1 may decode through the CharLS-coding
+    // retry, where samples can exceed MAXVAL by up to NEAR, exactly as CharLS
+    // decodes them (and never by more).
+    let sample_max = if effective_max < sof_max {
+        (effective_max + u32::from(near)).min(sof_max)
+    } else {
+        effective_max
+    };
+    assert_image_contract(&img, Some(sample_max));
     assert_eq!(
         (
             img.width,

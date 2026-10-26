@@ -14,7 +14,10 @@ and `test/data/`. Licensing and copyright are in `LICENSE` (BSD 3-Clause).
 | `t8nde0` / `t8nde3` | grayscale, non-default T1=T2=T3=9, RESET=31 | `test8bs2.pgm` (exact / within 3) |
 | `t8sse0` | line-interleaved with subsampled components | `Unsupported` |
 | `banny` | 8-bit RGB, ILV 1, CharLS encoder | `banny.ppm` exactly |
-| `banny-hp1/2/3` | the same with an HP colour transform (APP8 `mrfx`) | `Unsupported` |
+| `banny-hp1/2/3` | the same with HP colour transform 1 / 2 / 3 (APP8 `mrfx`) | `banny.ppm` exactly |
+| `test8_ilv_none_rm_7`, `test8_ilv_line_rm_7`, `test8_ilv_sample_rm_7` | `t8c0e0` / `t8c1e0` / `t8c2e0` with restart markers every 7 lines | `test8.ppm` exactly |
+| `test8_ilv_sample_rm_300` | ILV 2 with a restart interval longer than the image | `test8.ppm` exactly |
+| `test16_rm_5` | `t16e0` with restart markers every 5 lines | `test16.pgm` exactly |
 | `8bit-monochrome-2x2` | 2x2 grayscale | decodes |
 | `fuzzy-input-*`, `fuzzy_input_golomb_16`, `no_start_byte_after_encoded_scan` | fuzz-found malformed input | an error, never a panic |
 

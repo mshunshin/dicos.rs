@@ -4,6 +4,8 @@
 //! to reconstruct 16-bit samples. The default [`Profile::T87`] path is ITU-T
 //! T.87 conformant; [`Profile::LegacyGo`] reads frozen 1.0.0 bytes.
 
+use std::ops::Range;
+
 use crate::bitstream::BitReader;
 use crate::context::ContextModel;
 use crate::error::CodecError;
@@ -70,7 +72,7 @@ struct ScanHeader {
 }
 
 /// LSE ID=1 coding-parameter presets (T.87 C.2.4.1.1); `None` = spec default.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Presets {
     maxval: Option<i32>,
     t1: Option<i32>,
@@ -79,13 +81,70 @@ struct Presets {
     reset: Option<i32>,
 }
 
-/// Everything parsed up to and including the first SOS.
-struct Header {
-    frame: FrameHeader,
+/// What the marker segments have set: the frame's component ids and the LSE
+/// presets, restart interval and HP colour transform in force. An LSE or DRI
+/// between scans updates it for the scans that follow.
+#[derive(Clone, Default)]
+struct Segments {
     /// SOF55 component identifiers `Ci`, in frame order.
     component_ids: Vec<u8>,
     presets: Presets,
+    /// DRI restart interval, in lines (0: no restart markers).
+    restart_interval: usize,
+    /// HP colour transform from an APP8 `"mrfx"` segment (0: none).
+    transform: u8,
+}
+
+/// Everything parsed up to and including the first SOS.
+struct Header {
+    frame: FrameHeader,
+    segments: Segments,
     scan: ScanHeader,
+}
+
+/// How a scan's coding parameters are derived.
+///
+/// Two widely deployed encoders depart from T.87 in reproducible ways. A
+/// stream that fails to decode under T.87 is retried under each variant its
+/// header makes possible (see [`Coding::retries`]); a stream that decodes
+/// under T.87 is never reinterpreted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Coding {
+    /// ITU-T T.87.
+    T87,
+    /// CharLS 1.x (the copy bundled in DCMTK, among others) computed the
+    /// default thresholds for MAXVAL < 128 with the MAXVAL >= 128 formula
+    /// (CharLS #51) and wrote no LSE for them, e.g. DCMTK `dcmcjpls +pc` on
+    /// 6- and 7-bit images.
+    CharLs1Thresholds,
+    /// CharLS derives RANGE, LIMIT and qbpp (and the reconstruction range)
+    /// from the sample precision, using an LSE MAXVAL only for the default
+    /// thresholds.
+    CharLsMaxval,
+}
+
+impl Coding {
+    /// The variants worth retrying for this header, in order.
+    fn retries(header: &Header) -> Vec<Coding> {
+        let presets = &header.segments.presets;
+        let sof_max_val = (1i32 << header.frame.precision) - 1;
+        let max_val = presets.maxval.unwrap_or(sof_max_val);
+        let near = header.scan.near;
+        let mut retries = Vec::new();
+        if presets.maxval.is_some_and(|m| m != sof_max_val) {
+            retries.push(Coding::CharLsMaxval);
+        }
+        if presets.t1.is_none()
+            && presets.t2.is_none()
+            && presets.t3.is_none()
+            && max_val < 128
+            && ContextModel::scaled_thresholds(max_val, near)
+                != ContextModel::default_thresholds(max_val, near)
+        {
+            retries.push(Coding::CharLs1Thresholds);
+        }
+        retries
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -236,16 +295,14 @@ impl<'a> Decoder<'a> {
     }
 
     /// Read marker segments up to and including the next SOS, applying SOF55,
-    /// LSE and APP8 as they come and skipping DRI, COM and the other APPn.
+    /// LSE, DRI and APP8 as they come and skipping COM and the other APPn.
     ///
-    /// Used before the first scan (`frame` still `None`; SOF55 fills it and
-    /// `component_ids`) and between scans, where `done` components have
-    /// already been decoded.
+    /// Used before the first scan (`frame` still `None`; SOF55 fills it) and
+    /// between scans, where `done` components have already been decoded.
     fn read_segments(
         &mut self,
         frame: &mut Option<FrameHeader>,
-        component_ids: &mut Vec<u8>,
-        presets: &mut Presets,
+        segments: &mut Segments,
         done: usize,
     ) -> Result<ScanHeader, CodecError> {
         loop {
@@ -257,19 +314,15 @@ impl<'a> Decoder<'a> {
                     }
                     let (header, ids) = self.read_sof(length)?;
                     *frame = Some(header);
-                    *component_ids = ids;
+                    segments.component_ids = ids;
                 }
-                MARKER_LSE => self.read_lse(length, presets)?,
-                MARKER_APP8 => self.read_app8(length)?,
-                MARKER_DRI => {
-                    // Tolerate and skip DRI, as CharLS does: a zero restart
-                    // interval is a no-op. A non-zero interval that actually
-                    // emits RSTn markers in the scan is rejected by the entropy
-                    // decoder (scan_error), so restarts are still unsupported —
-                    // but a benign DRI segment no longer fails an otherwise
-                    // decodable stream.
-                    self.skip(length)?;
+                MARKER_LSE => self.read_lse(length, &mut segments.presets)?,
+                MARKER_APP8 => {
+                    if let Some(transform) = self.read_app8(length)? {
+                        segments.transform = transform;
+                    }
                 }
+                MARKER_DRI => segments.restart_interval = self.read_dri(length)?,
                 MARKER_SOS => {
                     let remaining = frame.as_ref().map(|f| f.components - done);
                     return self.read_sos(length, remaining);
@@ -416,16 +469,17 @@ impl<'a> Decoder<'a> {
 
     /// Parse an APP8 segment. The 5-byte HP colour-transform segment
     /// (`"mrfx"` + transform id, written by the HP LOCO-I codec and CharLS)
-    /// changes how the samples must be read back, so a transform other than
-    /// "none" is rejected rather than decoded to the wrong colours. Any other
-    /// APP8 (e.g. a SPIFF header) is skipped.
-    fn read_app8(&mut self, payload_len: usize) -> Result<(), CodecError> {
+    /// says how the decoded components map back to RGB; its id is returned.
+    /// HP1-HP3 are supported, as in CharLS; the lossy (4) and matrix (5)
+    /// transforms are not. Any other APP8 (e.g. a SPIFF header) is skipped.
+    fn read_app8(&mut self, payload_len: usize) -> Result<Option<u8>, CodecError> {
         let end = self.pos + payload_len;
+        let mut transform = None;
         if payload_len == 5 && self.data.get(self.pos..self.pos + 4) == Some(b"mrfx") {
             self.pos += 4;
-            match self.read_byte()? {
-                0 => {}
-                id @ 1..=5 => {
+            transform = Some(match self.read_byte()? {
+                id @ 0..=3 => id,
+                id @ 4..=5 => {
                     return Err(CodecError::Unsupported(format!(
                         "HP colour transform {id} (APP8 \"mrfx\") not supported"
                     )))
@@ -435,9 +489,26 @@ impl<'a> Decoder<'a> {
                         "unknown HP colour transform {other} (APP8 \"mrfx\")"
                     )))
                 }
-            }
+            });
         }
-        self.skip(end.saturating_sub(self.pos))
+        self.skip(end.saturating_sub(self.pos))?;
+        Ok(transform)
+    }
+
+    /// Parse DRI: the restart interval in lines, carried in 2, 3 or 4 bytes
+    /// (T.87 C.2.5; plain JPEG only allows 2).
+    fn read_dri(&mut self, payload_len: usize) -> Result<usize, CodecError> {
+        if !(2..=4).contains(&payload_len) {
+            return Err(CodecError::InvalidData(format!(
+                "DRI segment length {} invalid (2, 3 or 4 interval bytes)",
+                payload_len + 2
+            )));
+        }
+        let mut interval = 0usize;
+        for _ in 0..payload_len {
+            interval = interval << 8 | usize::from(self.read_byte()?);
+        }
+        Ok(interval)
     }
 
     /// Parse an SOS header. `remaining` is the number of frame components not
@@ -546,14 +617,12 @@ impl<'a> Decoder<'a> {
     fn read_header(&mut self) -> Result<Header, CodecError> {
         self.expect_marker(MARKER_SOI)?;
         let mut frame: Option<FrameHeader> = None;
-        let mut component_ids = Vec::new();
-        let mut presets = Presets::default();
-        let scan = self.read_segments(&mut frame, &mut component_ids, &mut presets, 0)?;
+        let mut segments = Segments::default();
+        let scan = self.read_segments(&mut frame, &mut segments, 0)?;
         let frame = frame.ok_or_else(|| CodecError::InvalidData("missing SOF55 marker".into()))?;
         Ok(Header {
             frame,
-            component_ids,
-            presets,
+            segments,
             scan,
         })
     }
@@ -585,7 +654,8 @@ impl<'a> Decoder<'a> {
 
         let pixels = match profile {
             Profile::LegacyGo => {
-                let (max_val, _) = validate_params(&frame, &header.presets, header.scan.near)?;
+                let (max_val, _) =
+                    validate_params(&frame, &header.segments.presets, header.scan.near)?;
                 let mut pixels = vec![0u16; frame.width * frame.height];
                 let scan_data = &self.data[self.pos..];
                 legacy::decode_scan(
@@ -604,21 +674,47 @@ impl<'a> Decoder<'a> {
         Ok((pixels, exp_width, exp_height))
     }
 
-    /// Decode every scan of the frame (the first SOS is already parsed) into
-    /// component-planar samples, then check the trailing EOI. T.87 path only.
+    /// Decode the frame's scans (the first SOS is already parsed) and check
+    /// the trailing EOI. T.87 path only.
+    ///
+    /// If the T.87 decode fails, the scans are decoded again under each CharLS
+    /// variant the header makes possible ([`Coding::retries`]); the first that
+    /// succeeds wins, and otherwise the T.87 error is returned.
+    fn decode_frame(&mut self, header: Header) -> Result<DecodedImage, CodecError> {
+        if header.segments.transform != 0 {
+            check_transform(header.segments.transform, &header.frame, &header.scan)?;
+        }
+        let start = self.pos;
+        let error = match self.decode_scans(&header, Coding::T87) {
+            Ok(image) => return Ok(image),
+            Err(e @ CodecError::Unsupported(_)) => return Err(e),
+            Err(e) => e,
+        };
+        for coding in Coding::retries(&header) {
+            self.pos = start;
+            if let Ok(image) = self.decode_scans(&header, coding) {
+                return Ok(image);
+            }
+        }
+        Err(error)
+    }
+
+    /// Decode every scan of the frame into component-planar samples under
+    /// `coding`, undo any HP colour transform, then check the trailing EOI.
     ///
     /// The scans may interleave differently (one component per scan, or up
     /// to four line- or sample-interleaved), as long as together they cover
     /// every component once; [`scan_targets`] places each scan's components.
     /// LSE, DRI, COM and APPn segments may sit between scans (CharLS reads
-    /// them too); an LSE there applies to the scans that follow.
-    fn decode_frame(&mut self, header: Header) -> Result<DecodedImage, CodecError> {
-        let Header {
-            frame,
-            component_ids,
-            mut presets,
-            scan: first,
-        } = header;
+    /// them too); an LSE or DRI there applies to the scans that follow.
+    fn decode_scans(
+        &mut self,
+        header: &Header,
+        coding: Coding,
+    ) -> Result<DecodedImage, CodecError> {
+        let frame = header.frame;
+        let first = header.scan;
+        let mut segments = header.segments.clone();
         let (w, h, nf) = (frame.width, frame.height, frame.components);
         // w*h*nf cannot overflow: read_sof caps it at MAX_SAMPLES.
         let plane = w * h;
@@ -636,12 +732,9 @@ impl<'a> Decoder<'a> {
                     first.near, scan.near
                 )));
             }
-            let (max_val, reset) = validate_params(&frame, &presets, scan.near)?;
-            let ctx = ContextModel::with_presets(
-                max_val, scan.near, reset, presets.t1, presets.t2, presets.t3,
-            );
+            let ctx = scan_context(&frame, &segments.presets, scan.near, coding)?;
             let ns = scan.components;
-            let targets = scan_targets(&component_ids, &decoded, &scan.selectors[..ns]);
+            let targets = scan_targets(&segments.component_ids, &decoded, &scan.selectors[..ns]);
             // Usually the scan's components are consecutive in the frame and
             // decode straight into their planes; otherwise via a scratch buffer.
             let first_target = targets[0];
@@ -661,8 +754,23 @@ impl<'a> Decoder<'a> {
                 h,
                 scan.ilv,
                 ctx,
+                segments.restart_interval,
                 scan_start,
             )?;
+            if coding == Coding::CharLsMaxval {
+                // A CharLS encoder keeps every reconstructed sample within NEAR
+                // of a source sample no larger than MAXVAL. Anything beyond
+                // that is not a CharLS stream, so this reading is rejected.
+                let sof_max_val = (1i32 << frame.precision) - 1;
+                let max_val = segments.presets.maxval.unwrap_or(sof_max_val);
+                let limit = (max_val + scan.near).min(sof_max_val);
+                if planes.iter().any(|&s| i32::from(s) > limit) {
+                    return Err(CodecError::InvalidData(format!(
+                        "samples above MAXVAL {max_val} + NEAR {} under CharLS coding",
+                        scan.near
+                    )));
+                }
+            }
             for (&t, src) in targets.iter().zip(scratch.chunks_exact(plane)) {
                 samples[t * plane..(t + 1) * plane].copy_from_slice(src);
             }
@@ -675,9 +783,14 @@ impl<'a> Decoder<'a> {
                 break;
             }
             self.skip_zero_padding();
-            scan = self.read_segments(&mut Some(frame), &mut Vec::new(), &mut presets, done)?;
+            scan = self.read_segments(&mut Some(frame), &mut segments, done)?;
         }
         self.expect_eoi()?;
+
+        if segments.transform != 0 {
+            check_transform(segments.transform, &frame, &first)?;
+            inverse_hp_transform(&mut samples, segments.transform, frame.precision);
+        }
 
         Ok(DecodedImage {
             samples,
@@ -688,6 +801,99 @@ impl<'a> Decoder<'a> {
             interleave_mode: first.ilv,
             near: first.near as u8,
         })
+    }
+}
+
+/// The context model for one scan, with the coding parameters `coding`
+/// derives from the frame and the presets in force.
+fn scan_context(
+    frame: &FrameHeader,
+    presets: &Presets,
+    near: i32,
+    coding: Coding,
+) -> Result<ContextModel, CodecError> {
+    let (max_val, reset) = validate_params(frame, presets, near)?;
+    // Explicit thresholds always win; `defaults` fill the rest.
+    let thresholds = |(d1, d2, d3): (i32, i32, i32)| {
+        (
+            Some(presets.t1.unwrap_or(d1)),
+            Some(presets.t2.unwrap_or(d2)),
+            Some(presets.t3.unwrap_or(d3)),
+        )
+    };
+    Ok(match coding {
+        Coding::T87 => {
+            ContextModel::with_presets(max_val, near, reset, presets.t1, presets.t2, presets.t3)
+        }
+        Coding::CharLs1Thresholds => {
+            let (t1, t2, t3) = thresholds(ContextModel::scaled_thresholds(max_val, near));
+            ContextModel::with_presets(max_val, near, reset, t1, t2, t3)
+        }
+        Coding::CharLsMaxval => {
+            let (t1, t2, t3) = thresholds(ContextModel::default_thresholds(max_val, near));
+            let coding_max_val = (1i32 << frame.precision) - 1;
+            ContextModel::with_presets(coding_max_val, near, reset, t1, t2, t3)
+        }
+    })
+}
+
+/// Check an HP colour transform can apply, by CharLS 3.0's rule: three
+/// components of 8 or 16 bits, coded lossless in an interleaved scan.
+fn check_transform(
+    transform: u8,
+    frame: &FrameHeader,
+    first: &ScanHeader,
+) -> Result<(), CodecError> {
+    if frame.components == 3
+        && matches!(frame.precision, 8 | 16)
+        && first.near == 0
+        && first.ilv != 0
+    {
+        Ok(())
+    } else {
+        Err(CodecError::InvalidData(format!(
+            "HP colour transform {transform} needs 3 lossless 8- or 16-bit components \
+             in an interleaved scan"
+        )))
+    }
+}
+
+/// Undo HP colour transform 1, 2 or 3 in place on three planes of `2^P`
+/// samples (P = 8 or 16), as the HP codec and CharLS define them:
+///
+/// - HP1: R = V1 + V2 - B, G = V2, B = V3 + V2 - B;
+/// - HP2: R = V1 + V2 - B, G = V2, B = V3 + (R + G) / 2 - B;
+/// - HP3: G = V1 - (V3 + V2) / 4 + 2^P / 4, R = V3 + G - B, B = V2 + G - B;
+///
+/// with `B = 2^(P-1)`, halving by an arithmetic shift, and every result taken
+/// modulo `2^P`.
+fn inverse_hp_transform(samples: &mut [u16], transform: u8, precision: u32) {
+    let range = 1i32 << precision;
+    let mask = range - 1;
+    let bias = range / 2;
+    let plane = samples.len() / 3;
+    let (first, rest) = samples.split_at_mut(plane);
+    let (second, third) = rest.split_at_mut(plane);
+    for ((s1, s2), s3) in first
+        .iter_mut()
+        .zip(second.iter_mut())
+        .zip(third.iter_mut())
+    {
+        let (v1, v2, v3) = (i32::from(*s1), i32::from(*s2), i32::from(*s3));
+        let (r, g, b) = match transform {
+            1 => (v1 + v2 - bias, v2, v3 + v2 - bias),
+            2 => {
+                let r = (v1 + v2 - bias) & mask;
+                (r, v2, v3 + ((r + v2) >> 1) - bias)
+            }
+            _ => {
+                let g = v1 - ((v3 + v2) >> 2) + range / 4;
+                (v3 + g - bias, g, v2 + g - bias)
+            }
+        };
+        *s1 = (r & mask) as u16;
+        *s2 = (g & mask) as u16;
+        *s3 = (b & mask) as u16;
     }
 }
 
@@ -793,7 +999,10 @@ fn validate_params(
 fn scan_error(e: CodecError, offset: usize) -> CodecError {
     match e {
         CodecError::Marker(m) if (0xFFD0..=0xFFD7).contains(&m) => {
-            CodecError::Unsupported("JPEG-LS restart markers (RSTn) in scan not supported".into())
+            CodecError::InvalidData(format!(
+                "restart marker RST{} at offset {offset} inside a restart interval",
+                m - 0xFFD0
+            ))
         }
         CodecError::Marker(_) | CodecError::InvalidData(_) => CodecError::Truncated {
             offset,
@@ -815,22 +1024,80 @@ fn scan_error(e: CodecError, offset: usize) -> CodecError {
 ///
 /// This is how CharLS (and the bundled CharLS 1.x in DCMTK) code the
 /// interleaved modes, and it decodes the HP-encoded T.87 conformance streams.
+///
+/// With a non-zero `restart_interval` (DRI), the scan is coded in intervals of
+/// that many lines (all components of a line, when interleaved), each ended by
+/// a byte-aligned `RSTm` marker, `m` counting 0-7 from the start of the scan.
+/// Every interval starts afresh, as CharLS does: initial statistics and
+/// `RUNindex`, and a previous line of zeros.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn decode_scan_t87(
     scan_data: &[u8],
     planes: &mut [u16],
     width: usize,
     height: usize,
     ilv: u8,
-    mut ctx: ContextModel,
+    ctx: ContextModel,
+    restart_interval: usize,
     base_offset: usize,
 ) -> Result<usize, CodecError> {
-    let mut br = BitReader::new(scan_data);
-    match ilv {
-        0 => decode_planar(&mut br, &mut ctx, planes, width, base_offset)?,
-        1 => decode_line_interleaved(&mut br, &mut ctx, planes, width, height, base_offset)?,
-        _ => decode_sample_interleaved(&mut br, &mut ctx, planes, width, height, base_offset)?,
+    let interval = if restart_interval == 0 {
+        height
+    } else {
+        restart_interval.min(height)
+    };
+    let initial = (interval < height).then(|| ctx.clone());
+    let mut ctx = ctx;
+    let mut pos = 0usize;
+    let mut first_line = 0usize;
+    let mut restart = 0u8;
+    loop {
+        let lines = first_line..(first_line + interval).min(height);
+        let end_line = lines.end;
+        let mut br = BitReader::new(&scan_data[pos..]);
+        let base = base_offset + pos;
+        match ilv {
+            0 => decode_planar(&mut br, &mut ctx, planes, width, lines, base)?,
+            1 => decode_line_interleaved(&mut br, &mut ctx, planes, width, height, lines, base)?,
+            _ => decode_sample_interleaved(&mut br, &mut ctx, planes, width, height, lines, base)?,
+        }
+        pos += br.marker_pos();
+        if end_line == height {
+            return Ok(pos);
+        }
+        pos = expect_restart_marker(scan_data, pos, restart, base_offset)?;
+        restart = (restart + 1) % 8;
+        first_line = end_line;
+        if let Some(initial) = &initial {
+            ctx = initial.clone();
+        }
     }
-    Ok(br.marker_pos())
+}
+
+/// Read the `RSTm` marker (`m = restart`) that must follow a restart interval
+/// at `pos`, after any `0x00` padding or `0xFF` fill bytes; returns the
+/// position after it.
+fn expect_restart_marker(
+    data: &[u8],
+    mut pos: usize,
+    restart: u8,
+    base_offset: usize,
+) -> Result<usize, CodecError> {
+    while data.get(pos) == Some(&0) {
+        pos += 1;
+    }
+    let at = base_offset + pos;
+    if data.get(pos) == Some(&0xFF) {
+        while data.get(pos) == Some(&0xFF) {
+            pos += 1;
+        }
+        if data.get(pos) == Some(&(0xD0 + restart)) {
+            return Ok(pos + 1);
+        }
+    }
+    Err(CodecError::InvalidData(format!(
+        "expected restart marker RST{restart} at offset {at}"
+    )))
 }
 
 /// ILV 0: one component, line after line. Kept out of line (as are the
@@ -841,11 +1108,12 @@ fn decode_planar(
     ctx: &mut ContextModel,
     plane: &mut [u16],
     width: usize,
+    lines: Range<usize>,
     base_offset: usize,
 ) -> Result<(), CodecError> {
     let mut prev = vec![0i32; width + 2];
     let mut cur = vec![0i32; width + 2];
-    for row in plane.chunks_exact_mut(width) {
+    for row in plane[lines.start * width..lines.end * width].chunks_exact_mut(width) {
         decode_line(br, ctx, &mut prev, &mut cur, row, base_offset)?;
         std::mem::swap(&mut prev, &mut cur);
     }
@@ -861,14 +1129,15 @@ fn decode_line_interleaved(
     planes: &mut [u16],
     width: usize,
     height: usize,
+    lines: Range<usize>,
     base_offset: usize,
 ) -> Result<(), CodecError> {
     let plane = width * height;
     let ns = planes.len() / plane;
-    let mut lines = vec![[vec![0i32; width + 2], vec![0i32; width + 2]]; ns];
+    let mut buffers = vec![[vec![0i32; width + 2], vec![0i32; width + 2]]; ns];
     let mut run_index = [0usize; MAX_SCAN_COMPONENTS];
-    for y in 0..height {
-        for (c, [prev, cur]) in lines.iter_mut().enumerate() {
+    for y in lines {
+        for (c, [prev, cur]) in buffers.iter_mut().enumerate() {
             ctx.run_index = run_index[c];
             let row = &mut planes[c * plane + y * width..][..width];
             decode_line(br, ctx, prev, cur, row, base_offset)?;
@@ -888,13 +1157,14 @@ fn decode_sample_interleaved(
     planes: &mut [u16],
     width: usize,
     height: usize,
+    lines: Range<usize>,
     base_offset: usize,
 ) -> Result<(), CodecError> {
     let plane = width * height;
     let ns = planes.len() / plane;
     let mut prev = vec![vec![0i32; width + 2]; ns];
     let mut cur = prev.clone();
-    for y in 0..height {
+    for y in lines {
         decode_line_sample(br, ctx, &mut prev, &mut cur, width, base_offset)?;
         for (c, line) in cur.iter().enumerate() {
             let row = &mut planes[c * plane + y * width..][..width];
@@ -1693,9 +1963,10 @@ mod tests {
     }
 
     #[test]
-    fn hp_colour_transform_segment_detected() {
-        // The HP/CharLS APP8 "mrfx" segment changes how samples read back; a
-        // transform other than 0 must not be skipped silently.
+    fn hp_colour_transform_segment_checked() {
+        // The HP/CharLS APP8 "mrfx" segment says how components map back to
+        // RGB. HP1-3 need three lossless 8/16-bit interleaved components, so on
+        // this grayscale stream they are invalid; 4 and 5 are unsupported.
         let (buf, pixels) = encode_mono_4x4();
         let with_app8 = |payload: &[u8]| {
             let mut s = buf[..2].to_vec();
@@ -1705,21 +1976,269 @@ mod tests {
             s.extend_from_slice(&buf[2..]);
             s
         };
-        assert_eq!(decode(&with_app8(b"mrfx\x00"), 4, 4).unwrap().0, pixels);
-        for id in [1u8, 3, 5] {
+        let mrfx = |id: u8| with_app8(&[b'm', b'r', b'f', b'x', id]);
+        assert_eq!(decode(&mrfx(0), 4, 4).unwrap().0, pixels);
+        for id in [1u8, 2, 3, 9] {
+            assert!(
+                matches!(decode(&mrfx(id), 4, 4), Err(CodecError::InvalidData(_))),
+                "transform {id}"
+            );
+        }
+        for id in [4u8, 5] {
             assert!(matches!(
-                decode(&with_app8(&[b'm', b'r', b'f', b'x', id]), 4, 4),
+                decode(&mrfx(id), 4, 4),
                 Err(CodecError::Unsupported(_))
             ));
         }
-        assert!(matches!(
-            decode(&with_app8(b"mrfx\x09"), 4, 4),
-            Err(CodecError::InvalidData(_))
-        ));
         // Any other APP8 (here a SPIFF-like header) is skipped.
         let mut spiff = b"SPIFF\x00".to_vec();
         spiff.resize(30, 0);
         assert_eq!(decode(&with_app8(&spiff), 4, 4).unwrap().0, pixels);
+    }
+
+    #[test]
+    fn hp_transforms_invert_charls_forward_transforms() {
+        // The forward transforms as CharLS writes them (color_transform.hpp),
+        // wrapping at 2^P; the decoder's inverse must undo each exactly.
+        for precision in [8u32, 16] {
+            let range = 1i32 << precision;
+            let (mask, bias) = (range - 1, range / 2);
+            let rgb: Vec<[i32; 3]> = (0..500)
+                .map(|i: i32| [i * 7919 % range, i * 104_729 % range, (i * i * 31) % range])
+                .collect();
+            for transform in 1u8..=3 {
+                let forward = |[r, g, b]: [i32; 3]| match transform {
+                    1 => [(r - g + bias) & mask, g, (b - g + bias) & mask],
+                    2 => [(r - g + bias) & mask, g, (b - ((r + g) >> 1) + bias) & mask],
+                    _ => {
+                        let v2 = (b - g + bias) & mask;
+                        let v3 = (r - g + bias) & mask;
+                        [(g + ((v2 + v3) >> 2) - range / 4) & mask, v2, v3]
+                    }
+                };
+                let n = rgb.len();
+                let mut planar = vec![0u16; 3 * n];
+                for (i, &px) in rgb.iter().enumerate() {
+                    for (c, v) in forward(px).into_iter().enumerate() {
+                        planar[c * n + i] = v as u16;
+                    }
+                }
+                inverse_hp_transform(&mut planar, transform, precision);
+                for (i, px) in rgb.iter().enumerate() {
+                    let back = [planar[i], planar[n + i], planar[2 * n + i]].map(i32::from);
+                    assert_eq!(back, *px, "HP{transform}, P = {precision}, pixel {i}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dri_takes_two_to_four_interval_bytes() {
+        let (buf, pixels) = encode_mono_4x4();
+        let with_dri = |payload: &[u8]| {
+            let mut s = buf[..2].to_vec();
+            s.extend_from_slice(&[0xFF, 0xDD]);
+            s.extend_from_slice(&(payload.len() as u16 + 2).to_be_bytes());
+            s.extend_from_slice(payload);
+            s.extend_from_slice(&buf[2..]);
+            s
+        };
+        for payload in [&[0u8, 0][..], &[0, 0, 0], &[0, 0, 0, 0], &[0, 0, 0, 9]] {
+            // An interval of 9 lines covers this 4-line image: no markers.
+            assert_eq!(decode(&with_dri(payload), 4, 4).unwrap().0, pixels);
+        }
+        for payload in [&[0u8][..], &[0, 0, 0, 0, 0]] {
+            assert!(matches!(
+                decode(&with_dri(payload), 4, 4),
+                Err(CodecError::InvalidData(_))
+            ));
+        }
+    }
+
+    /// A grayscale stream coded in restart intervals of `interval` lines: each
+    /// interval is an independent scan of its lines (fresh statistics, a
+    /// previous line of zeros), followed by `RST(k mod 8)`. `marker` maps the
+    /// k-th marker code, to inject faults.
+    fn restart_stream(
+        pixels: &[u16],
+        w: usize,
+        h: usize,
+        interval: usize,
+        marker: impl Fn(usize) -> u8,
+    ) -> Vec<u8> {
+        let mut out: Vec<u8> = vec![0xFF, 0xD8, 0xFF, 0xF7, 0x00, 11, 8];
+        out.extend_from_slice(&(h as u16).to_be_bytes());
+        out.extend_from_slice(&(w as u16).to_be_bytes());
+        out.extend_from_slice(&[1, 1, 0x11, 0x00]);
+        out.extend_from_slice(&[0xFF, 0xDD, 0x00, 0x04]);
+        out.extend_from_slice(&(interval as u16).to_be_bytes());
+        out.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x08, 1, 1, 0, 0, 0, 0]);
+        for (k, rows) in pixels.chunks(interval * w).enumerate() {
+            if k > 0 {
+                out.extend_from_slice(&[0xFF, marker(k - 1)]);
+            }
+            let ctx = ContextModel::new(255, 0, DEFAULT_RESET);
+            encode_scan_t87(&mut out, rows, w, rows.len() / w, ctx).unwrap();
+        }
+        out.extend_from_slice(&[0xFF, 0xD9]);
+        out
+    }
+
+    #[test]
+    fn restart_intervals_decode() {
+        let (w, h) = (9usize, 11usize);
+        let pixels: Vec<u16> = (0..(w * h) as u32)
+            .map(|i| ((i * 37 + i / 9 * 5) % 256) as u16)
+            .collect();
+        let rst = |k: usize| 0xD0 + (k % 8) as u8;
+        // A short last interval, and (with 1-line intervals) RST7 -> RST0 wrap.
+        for interval in [3usize, 4, 1] {
+            let s = restart_stream(&pixels, w, h, interval, rst);
+            let (decoded, _, _) = decode(&s, w as u32, h as u32)
+                .unwrap_or_else(|e| panic!("interval {interval}: {e}"));
+            assert_eq!(decoded, pixels, "interval {interval}");
+        }
+    }
+
+    #[test]
+    fn restart_marker_faults_rejected() {
+        let (w, h) = (9usize, 11usize);
+        let pixels: Vec<u16> = (0..(w * h) as u32).map(|i| (i * 13 % 256) as u16).collect();
+        // Out of sequence: RST0, RST2, ...
+        let skipped = restart_stream(&pixels, w, h, 3, |k| 0xD0 + 2 * k as u8);
+        assert!(matches!(
+            decode(&skipped, w as u32, h as u32),
+            Err(CodecError::InvalidData(_))
+        ));
+        // A DRI promising markers the (continuous) scan does not have.
+        let (mut plain, _) = encode_mono_4x4();
+        let sos = plain.windows(2).position(|p| p == [0xFF, 0xDA]).unwrap();
+        plain.splice(sos..sos, [0xFF, 0xDD, 0x00, 0x04, 0x00, 0x01]);
+        assert!(matches!(
+            decode(&plain, 4, 4),
+            Err(CodecError::InvalidData(_))
+        ));
+        // Markers without a DRI.
+        let mut no_dri = restart_stream(&pixels, w, h, 3, |k| 0xD0 + k as u8);
+        let dri = no_dri.windows(2).position(|p| p == [0xFF, 0xDD]).unwrap();
+        no_dri.drain(dri..dri + 6);
+        assert!(decode(&no_dri, w as u32, h as u32).is_err());
+    }
+
+    /// SOI + SOF55 + optional LSE ID=1 + SOS + one scan coded with `ctx` + EOI.
+    fn stream_with_ctx(
+        precision: u8,
+        pixels: &[u16],
+        w: usize,
+        h: usize,
+        lse: Option<[u16; 5]>,
+        ctx: ContextModel,
+    ) -> Vec<u8> {
+        let mut out: Vec<u8> = vec![0xFF, 0xD8, 0xFF, 0xF7, 0x00, 11, precision];
+        out.extend_from_slice(&(h as u16).to_be_bytes());
+        out.extend_from_slice(&(w as u16).to_be_bytes());
+        out.extend_from_slice(&[1, 1, 0x11, 0x00]);
+        if let Some(fields) = lse {
+            out.extend_from_slice(&[0xFF, 0xF8, 0x00, 13, 1]);
+            for v in fields {
+                out.extend_from_slice(&v.to_be_bytes());
+            }
+        }
+        out.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x08, 1, 1, 0, ctx.near as u8, 0, 0]);
+        encode_scan_t87(&mut out, pixels, w, h, ctx).unwrap();
+        out.extend_from_slice(&[0xFF, 0xD9]);
+        out
+    }
+
+    fn textured(w: usize, h: usize, max_val: u32) -> Vec<u16> {
+        (0..(w * h) as u32)
+            .map(|i| ((i * 37 + (i / w as u32) * 11 + (i * i) % 7) % (max_val + 1)) as u16)
+            .collect()
+    }
+
+    #[test]
+    fn charls1_default_thresholds_retried() {
+        // DCMTK's CharLS 1.x codes 6/7-bit images with T1/T2/T3 from the
+        // MAXVAL >= 128 formula and writes no LSE. T.87 defaults fail on them;
+        // the retry decodes them exactly.
+        let (w, h) = (48usize, 32usize);
+        for precision in [6u8, 7] {
+            let max_val = (1i32 << precision) - 1;
+            let pixels = textured(w, h, max_val as u32);
+            let (t1, t2, t3) = ContextModel::scaled_thresholds(max_val, 0);
+            assert_ne!((t1, t2, t3), ContextModel::default_thresholds(max_val, 0));
+            let ctx =
+                ContextModel::with_presets(max_val, 0, DEFAULT_RESET, Some(t1), Some(t2), Some(t3));
+            let s = stream_with_ctx(precision, &pixels, w, h, None, ctx);
+            let (decoded, _, _) =
+                decode(&s, w as u32, h as u32).unwrap_or_else(|e| panic!("P {precision}: {e}"));
+            assert_eq!(decoded, pixels, "P {precision}");
+
+            // A conformant stream of the same depth decodes as T.87 coded it.
+            let s = stream_with_ctx(
+                precision,
+                &pixels,
+                w,
+                h,
+                None,
+                ContextModel::new(max_val, 0, DEFAULT_RESET),
+            );
+            assert_eq!(
+                decode(&s, w as u32, h as u32).unwrap().0,
+                pixels,
+                "P {precision} T.87"
+            );
+        }
+    }
+
+    #[test]
+    fn charls_maxval_retry_rejects_out_of_range_samples() {
+        // Samples up to 255 coded CharLS-style under an LSE MAXVAL of 100: no
+        // CharLS encoder produces that, so the retry must not accept it and
+        // hand back samples above MAXVAL (found by fuzzing `decode_lse`).
+        let (w, h) = (48usize, 32usize);
+        let pixels = textured(w, h, 255);
+        let (t1, t2, t3) = ContextModel::default_thresholds(100, 0);
+        let ctx = ContextModel::with_presets(255, 0, DEFAULT_RESET, Some(t1), Some(t2), Some(t3));
+        let s = stream_with_ctx(8, &pixels, w, h, Some([100, 0, 0, 0, 0]), ctx);
+        match decode_image(&s) {
+            Err(_) => {}
+            Ok(img) => assert!(img.samples.iter().all(|&v| v <= 100), "sample above MAXVAL"),
+        }
+    }
+
+    #[test]
+    fn charls_maxval_coding_retried() {
+        // CharLS codes a stream with an LSE MAXVAL below 2^P - 1 with RANGE,
+        // LIMIT and qbpp from P, taking only the default thresholds from
+        // MAXVAL. Those streams decode through the retry; T.87-coded ones with
+        // the same header still decode directly.
+        let (w, h) = (48usize, 32usize);
+        for (precision, maxval, near) in [(8u8, 200i32, 0i32), (16, 4095, 0), (16, 4096, 2)] {
+            let pixels = textured(w, h, maxval as u32);
+            let lse = Some([maxval as u16, 0, 0, 0, 0]);
+            let (t1, t2, t3) = ContextModel::default_thresholds(maxval, near);
+            let charls = ContextModel::with_presets(
+                (1i32 << precision) - 1,
+                near,
+                DEFAULT_RESET,
+                Some(t1),
+                Some(t2),
+                Some(t3),
+            );
+            let t87 = ContextModel::new(maxval, near, DEFAULT_RESET);
+            for (name, ctx) in [("CharLS", charls), ("T.87", t87)] {
+                let s = stream_with_ctx(precision, &pixels, w, h, lse, ctx);
+                let img = decode_image(&s)
+                    .unwrap_or_else(|e| panic!("{name} P {precision} MAXVAL {maxval}: {e}"));
+                for (got, want) in img.samples.iter().zip(&pixels) {
+                    assert!(
+                        (i32::from(*got) - i32::from(*want)).abs() <= near,
+                        "{name} P {precision} MAXVAL {maxval}"
+                    );
+                }
+            }
+        }
     }
 
     /// Assemble a 3-component, planar (ILV 0) JPEG-LS stream: one SOS + scan
