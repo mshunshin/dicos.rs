@@ -461,9 +461,12 @@ impl<'a> Decoder<'a> {
                 self.skip(payload_len - 11)?;
                 Ok(())
             }
-            2..=4 => Err(CodecError::Unsupported(format!(
-                "LSE ID={id} (mapping tables) not supported"
+            2 | 3 => Err(CodecError::Unsupported(format!(
+                "LSE ID={id} (mapping table) not supported"
             ))),
+            4 => Err(CodecError::Unsupported(
+                "LSE ID=4 (oversize image dimensions) not supported".into(),
+            )),
             other => Err(CodecError::InvalidData(format!("unknown LSE ID={other}"))),
         }
     }

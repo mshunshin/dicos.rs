@@ -18,6 +18,10 @@
 //! [`encode_image`] writes `ILV = 0`. Verified against the T.87 conformance
 //! streams, CharLS and DCMTK output.
 //!
+//! Not supported (`Unsupported`): component subsampling, mapping tables
+//! (palettised images), LSE ID 4 oversize dimensions, HP transforms 4 and 5,
+//! and JPEG-LS Part 2 frames. The crate README describes each.
+//!
 //! The decoder also accepts what CharLS accepts from real-world encoders:
 //! `0x00` or `0xFF` padding before the next marker, LSE / COM / APPn / DRI
 //! segments between scans, an LSE `RESET` of 0 (the default), and a non-zero

@@ -31,12 +31,11 @@ A frame whose SOF55 height is 0 takes its height from the DNL segment that
 ends the first scan (2, 3 or 4 bytes, T.87 C.2.6), as CharLS 3.0 reads it; the
 decoder finds the DNL before decoding, passing any restart markers.
 
-Rejected as `Unsupported`: LSE mapping tables, component subsampling, and the
-HP lossy / matrix transforms (4, 5). Rejected as `InvalidData`: a non-zero
-point transform, an impossible scan component count, an interleave mode that
-does not fit it, an HP transform where it cannot apply (including any scan
-with a non-zero NEAR), a missing or out-of-sequence `RSTm`, and a height of 0
-with no DNL to give it.
+Rejected as `InvalidData`: a non-zero point transform, an impossible scan
+component count, an interleave mode that does not fit it, an HP transform
+where it cannot apply (including any scan with a non-zero NEAR), a missing or
+out-of-sequence `RSTm`, and a height of 0 with no DNL to give it. What is
+rejected as `Unsupported` is listed under [Not supported](#not-supported).
 
 Interop is verified bit-exactly against the **ITU-T T.87 conformance**
 streams (HP encoder), **CharLS** test streams and CharLS-encoded images
@@ -82,6 +81,36 @@ not lossless for **four-component, sample-interleaved** images — a pixel that
 differs from its left neighbour only in the 4th component (e.g. alpha) is coded
 as part of a run, and that change is lost. Every decoder, this one included,
 reproduces the stream as written.
+
+### Not supported
+
+These parts of T.87 are rejected as `Unsupported`. No DICOM producer is known
+to write any of them, and CharLS rejects the first two as well.
+
+- **Component subsampling.** SOF55 gives each component sampling factors H
+  and V (1–4); a component's plane is the image width × H / max H by height ×
+  V / max V, as for YCbCr 4:2:0 chroma. Only `H = V = 1` is accepted, because
+  `DecodedImage` holds equal-sized planes. The T.87 conformance streams
+  `t8sse0` / `t8sse3` are the only known examples.
+- **HP colour transforms 4 (lossy) and 5 (matrix).** HP1–HP3 are decoded.
+- **Mapping tables (palettised images).** The coded samples are indices into a
+  table: LSE ID 2 defines one (a table ID, bytes per entry, entries), LSE ID 3
+  continues it, each SOS component names one through its selector `Tm`, and a
+  separate tables-only (abbreviated) stream may carry them. CharLS 3.0 returns
+  the tables without applying them. DICOM keeps a palette in the dataset
+  (`PALETTE COLOR`) and codes the indices as a plain greyscale image, which
+  decodes.
+- **Oversize dimensions.** LSE ID 4 gives a width or height above 65535 (SOF55
+  holds 16 bits). Separately, this decoder caps any frame at `2^28` pixels per
+  plane and `3 × 2^28` samples in all (`InvalidParameter`), so a crafted header
+  cannot demand a multi-GiB buffer.
+- **Other frame types**: JPEG-LS Part 2 (ITU-T T.870 / ISO/IEC 14495-2)
+  frames (SOF57), and the frame markers of ordinary JPEG (SOF0–SOF15), a
+  different codec. LSE IDs above 4, which only Part 2 defines, are
+  `InvalidData`.
+
+The encoder writes the common subset only: one `ILV = 0` scan per component,
+default presets (no LSE), and no restart markers, DNL or colour transform.
 
 ### Profiles
 
