@@ -51,6 +51,33 @@ fn clamp_threshold(i: i32, lo: i32, hi: i32) -> i32 {
     }
 }
 
+/// The smallest `k` with `n << k >= a` (T.87 A.5.1 / A.7.2.2), for `n >= 1`
+/// and `a >= 0` (0 when `n` is 0, as a guard): from the leading-zero counts,
+/// `n << k` reaches the bit length of `a`; one more doubling covers the rest.
+#[inline]
+fn golomb_k(n: i32, a: i32) -> i32 {
+    if n <= 0 {
+        return 0;
+    }
+    let k = (n.leading_zeros() as i32 - a.leading_zeros() as i32).max(0);
+    if (n << k) < a {
+        k + 1
+    } else {
+        k
+    }
+}
+
+/// Fold a signed context id into `(Q, sign)` (T.87 A.3.4): `Q` is its
+/// magnitude, `sign` is `-1` when it is negative.
+#[inline]
+pub(crate) fn split_context_id(qs: i32) -> (usize, i32) {
+    if qs < 0 {
+        ((-qs) as usize, -1)
+    } else {
+        (qs as usize, 1)
+    }
+}
+
 /// The T.87 context model state used during encoding and decoding.
 #[derive(Clone)]
 pub(crate) struct ContextModel {
@@ -178,62 +205,49 @@ impl ContextModel {
 
     /// Near-aware gradient quantization into one of 9 buckets (-4..=4), T.87
     /// A.3.3.
+    ///
+    /// Branch-free form of the T.87 comparison chain: the bucket is the sign
+    /// of `d` times the number of bounds `|d|` reaches (`> NEAR`, `>= T1`,
+    /// `>= T2`, `>= T3`). The two agree whenever `NEAR < T1 <= T2 <= T3`, which
+    /// `validate_params` guarantees for every threshold set used.
     #[inline]
     pub fn quantize_gradient(&self, d: i32) -> i32 {
-        if d <= -self.t3 {
-            -4
-        } else if d <= -self.t2 {
-            -3
-        } else if d <= -self.t1 {
-            -2
-        } else if d < -self.near {
-            -1
-        } else if d <= self.near {
-            0
-        } else if d < self.t1 {
-            1
-        } else if d < self.t2 {
-            2
-        } else if d < self.t3 {
-            3
+        let m = d.abs();
+        let q = i32::from(m > self.near)
+            + i32::from(m >= self.t1)
+            + i32::from(m >= self.t2)
+            + i32::from(m >= self.t3);
+        if d < 0 {
+            -q
         } else {
-            4
+            q
         }
+    }
+
+    /// The signed context id `81*Q1 + 9*Q2 + Q3` of three gradients (T.87
+    /// A.3.4, before sign folding): `0` exactly when all three are within
+    /// NEAR (run mode), and otherwise negative exactly when the first non-zero
+    /// `Qi` is, since the lower terms cannot outweigh it.
+    #[inline]
+    pub fn context_id(&self, d1: i32, d2: i32, d3: i32) -> i32 {
+        81 * self.quantize_gradient(d1)
+            + 9 * self.quantize_gradient(d2)
+            + self.quantize_gradient(d3)
     }
 
     /// Compute the context index `Q` and the `sign` from the three gradients.
     ///
     /// Returns `(Q, sign)` where `sign` is `1` or `-1`.
+    #[inline]
     pub fn get_context_index(&self, d1: i32, d2: i32, d3: i32) -> (usize, i32) {
-        let mut q1 = self.quantize_gradient(d1);
-        let mut q2 = self.quantize_gradient(d2);
-        let mut q3 = self.quantize_gradient(d3);
-
-        let mut sign = 1i32;
-        if q1 < 0 || (q1 == 0 && q2 < 0) || (q1 == 0 && q2 == 0 && q3 < 0) {
-            q1 = -q1;
-            q2 = -q2;
-            q3 = -q3;
-            sign = -1;
-        }
-
-        let index = (q1 * 81 + q2 * 9 + q3) as usize;
-        (index, sign)
+        split_context_id(self.context_id(d1, d2, d3))
     }
 
     /// Compute the Golomb-Rice parameter `k` for a regular context `q`
     /// (T.87 A.5.1): smallest `k` with `N[Q] << k >= A[Q]`.
+    #[inline]
     pub fn compute_k(&self, q: usize) -> i32 {
-        let n = self.n[q];
-        if n == 0 {
-            return 0;
-        }
-        let a = self.a[q];
-        let mut k = 0i32;
-        while k < 31 && (n << k) < a {
-            k += 1;
-        }
-        k
+        golomb_k(self.n[q], self.a[q])
     }
 
     /// Update A/B/N (T.87 A.6.1, code segment A.12) then the bias C (A.6.2,
@@ -306,12 +320,7 @@ impl ContextModel {
         } else {
             self.a[RUN_CTX_BASE]
         };
-        let n = self.n[ctx];
-        let mut k = 0i32;
-        while k < 31 && (n << k) < temp {
-            k += 1;
-        }
-        k
+        golomb_k(self.n[ctx], temp)
     }
 
     /// Update run-interruption statistics (T.87 A.7.2, code segment A.23).
@@ -456,6 +465,58 @@ mod tests {
         assert_eq!(m.quantize_gradient(17), 3);
         assert_eq!(m.quantize_gradient(35), 4);
         assert_eq!(m.quantize_gradient(-35), -4);
+    }
+
+    #[test]
+    fn golomb_k_matches_the_doubling_loop() {
+        let looped = |n: i32, a: i32| {
+            let mut k = 0;
+            while k < 31 && (i64::from(n) << k) < i64::from(a) {
+                k += 1;
+            }
+            k
+        };
+        for n in (1..=200).chain([255, 256, 1000, 32767, 65535]) {
+            for a in (0..=4000).chain([65535, 1 << 20, (1 << 30) - 1, 1 << 30, i32::MAX]) {
+                assert_eq!(golomb_k(n, a), looped(n, a), "n {n} a {a}");
+            }
+        }
+    }
+
+    #[test]
+    fn quantizer_matches_t87_comparison_chain() {
+        // The T.87 A.3.3 chain, written out, against the branch-free form.
+        for (max_val, near) in [(255, 0), (255, 2), (65535, 0), (100, 0), (4095, 3), (63, 1)] {
+            let m = ContextModel::new(max_val, near, 64);
+            let chain = |d: i32| {
+                if d <= -m.t3 {
+                    -4
+                } else if d <= -m.t2 {
+                    -3
+                } else if d <= -m.t1 {
+                    -2
+                } else if d < -near {
+                    -1
+                } else if d <= near {
+                    0
+                } else if d < m.t1 {
+                    1
+                } else if d < m.t2 {
+                    2
+                } else if d < m.t3 {
+                    3
+                } else {
+                    4
+                }
+            };
+            for d in -max_val..=max_val {
+                assert_eq!(
+                    m.quantize_gradient(d),
+                    chain(d),
+                    "MAXVAL {max_val} NEAR {near} d {d}"
+                );
+            }
+        }
     }
 
     // -- Context index --
