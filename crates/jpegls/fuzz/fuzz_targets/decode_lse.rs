@@ -16,7 +16,9 @@
 //!   component's NEAR when that preset is below `2^P - 1`, where the
 //!   CharLS-coding retry may apply;
 //! - the frame and scan fields come back as written, each component's NEAR
-//!   included;
+//!   included — this and the sample bound only for the first component when
+//!   the scan bytes hold an LSE or SOS segment of their own, which the
+//!   decoder applies to the scans after it, as CharLS does;
 //! - the accepted preset obeys the rules the decoder documents: MAXVAL within
 //!   the SOF precision, RESET 0 (the default) or `3..=max(255, MAXVAL)`,
 //!   NEAR <= min(255, MAXVAL/2);
@@ -159,9 +161,16 @@ fuzz_target!(|data: &[u8]| {
             effective_max
         }
     };
-    assert_image_contract(&img, Some(sample_max(near)));
+    // Fuzz bytes may themselves hold an LSE or SOS segment, and the scans
+    // after it then run under its preset or NEAR: only the first scan
+    // (component 0) is sure to run under the header's.
+    let foreign = body
+        .windows(2)
+        .any(|p| p == [0xFF, 0xF8] || p == [0xFF, 0xDA]);
+    let known = if foreign { 1 } else { usize::from(nf) };
+    assert_image_contract(&img, Some(if foreign { sof_max } else { sample_max(near) }));
     let plane = usize::from(width) * usize::from(height);
-    for (c, samples) in img.samples.chunks(plane).enumerate() {
+    for (c, samples) in img.samples.chunks(plane).enumerate().take(known) {
         let max = sample_max(component_near[c]);
         assert!(
             samples.iter().all(|&s| u32::from(s) <= max),
@@ -174,18 +183,19 @@ fuzz_target!(|data: &[u8]| {
             img.height,
             img.components,
             img.bits_per_sample,
-            img.near,
-            &img.component_near
+            &img.component_near[..known]
         ),
         (
             u32::from(width),
             u32::from(height),
             nf,
             precision,
-            near,
-            &component_near
+            &component_near[..known]
         ),
         "frame or scan fields changed"
     );
+    if !foreign {
+        assert_eq!(img.near, near, "near is not the first scan's NEAR");
+    }
     assert_decode_agrees(&stream, &img);
 });
