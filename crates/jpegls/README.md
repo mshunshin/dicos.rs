@@ -27,11 +27,16 @@ fresh statistics as CharLS does, and so are HP colour transforms HP1–HP3
 (APP8 `"mrfx"`; three lossless 8- or 16-bit components in an interleaved scan,
 CharLS 3.0's rule).
 
+A frame whose SOF55 height is 0 takes its height from the DNL segment that
+ends the first scan (2, 3 or 4 bytes, T.87 C.2.6), as CharLS 3.0 reads it; the
+decoder finds the DNL before decoding, passing any restart markers.
+
 Rejected as `Unsupported`: LSE mapping tables, component subsampling, and the
 HP lossy / matrix transforms (4, 5). Rejected as `InvalidData`: a non-zero
 point transform, an impossible scan component count, an interleave mode that
 does not fit it, an HP transform where it cannot apply (including any scan
-with a non-zero NEAR), and a missing or out-of-sequence `RSTm`.
+with a non-zero NEAR), a missing or out-of-sequence `RSTm`, and a height of 0
+with no DNL to give it.
 
 Interop is verified bit-exactly against the **ITU-T T.87 conformance**
 streams (HP encoder), **CharLS** test streams and CharLS-encoded images
@@ -200,6 +205,8 @@ LSE   - JPEG-LS Preset Parameters (0xFFF8, optional)
 SOS   - Start of Scan (0xFFDA)
         Component selector(s), Near parameter (0 = lossless), ILV
 [entropy-coded image data]
+DNL   - Define Number of Lines (0xFFDC, optional: only after the first scan,
+        when SOF55 gives the height as 0)
 (multi-component: SOS + scan repeat until every component is covered —
  one component per ILV = 0 scan, up to four per ILV = 1/2 scan)
 EOI   - End of Image (0xFFD9)
