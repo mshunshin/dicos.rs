@@ -158,6 +158,29 @@ fn dcmtk_interleaved_truncation_is_an_error() {
     }
 }
 
+#[test]
+fn dnl_spliced_into_dcmtk_streams() {
+    // Each DCMTK stream with its SOF55 height moved into a DNL segment after
+    // the scan (T.87 C.2.6) still decodes to `dcmdjpls`'s output.
+    let Some(dir) = fixture_dir("dcmtk") else {
+        return;
+    };
+    for (stem, bytes, reference) in dcmtk_streams(&dir) {
+        let sof = bytes.windows(2).position(|p| p == [0xFF, 0xF7]).unwrap();
+        let height = [bytes[sof + 5], bytes[sof + 6]];
+        let mut stream = bytes.clone();
+        stream[sof + 5..sof + 7].copy_from_slice(&[0, 0]);
+        // DCMTK writes one scan, which ends at the EOI (after any fill).
+        let mut end = stream.len() - 2;
+        while stream[end - 1] == 0xFF {
+            end -= 1;
+        }
+        stream.splice(end..end, [0xFF, 0xDC, 0x00, 0x04, height[0], height[1]]);
+        let img = jpegls::decode_image(&stream).unwrap_or_else(|e| panic!("{stem}: {e}"));
+        assert_matches(&stem, &img, &reference, 0);
+    }
+}
+
 /// The SOS segment and entropy data of a single-scan stream (everything from
 /// SOS up to EOI, without any 0xFF fill before EOI).
 fn scan_segment(stream: &[u8]) -> Vec<u8> {
@@ -594,7 +617,8 @@ fn feature_caps_lists_every_capability() {
             "restart",
             "hp-transform",
             "charls-retry",
-            "near-per-scan"
+            "near-per-scan",
+            "dnl"
         ]
     );
 }

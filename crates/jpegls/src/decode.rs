@@ -25,6 +25,7 @@ const MARKER_SOS: u16 = 0xFFDA;
 const MARKER_SOF55: u16 = 0xFFF7;
 const MARKER_LSE: u16 = 0xFFF8;
 const MARKER_DRI: u16 = 0xFFDD;
+const MARKER_DNL: u16 = 0xFFDC;
 const MARKER_APP8: u16 = 0xFFE8;
 
 /// Default statistics reset threshold (T.87 A.2.1 RESET).
@@ -100,6 +101,9 @@ struct Header {
     frame: FrameHeader,
     segments: Segments,
     scan: ScanHeader,
+    /// SOF55 left the height 0 and a DNL segment after the first scan gave it
+    /// (already in `frame`).
+    dnl: bool,
 }
 
 /// How a scan's coding parameters are derived.
@@ -371,24 +375,12 @@ impl<'a> Decoder<'a> {
         let height = self.read_u16be()? as usize;
         let width = self.read_u16be()? as usize;
 
-        // Reject degenerate / oversized frames before any large allocation.
-        // T.87 permits 1..=65535 per axis; also cap the pixel product so a
-        // crafted 65535x65535 header cannot request an ~8 GiB buffer.
-        if width == 0 || height == 0 {
+        // A height of 0 means a DNL segment at the end of the first scan gives
+        // it (T.87 C.2.6); `read_header` finds it and checks the size then.
+        if width == 0 {
             return Err(CodecError::InvalidData(
-                "SOF55 dimensions must be non-zero".into(),
+                "SOF55 width must be non-zero".into(),
             ));
-        }
-        if width
-            .checked_mul(height)
-            .filter(|&n| n <= MAX_PIXELS)
-            .is_none()
-        {
-            return Err(CodecError::InvalidParameter {
-                name: "width*height",
-                value: (width as i64).saturating_mul(height as i64),
-                allowed: "product <= 268435456 pixels (1<<28)",
-            });
         }
 
         let nf = self.read_byte()?;
@@ -399,13 +391,8 @@ impl<'a> Decoder<'a> {
                 "SOF55 component count must be non-zero".into(),
             ));
         }
-        let samples = width * height * usize::from(nf);
-        if samples > MAX_SAMPLES {
-            return Err(CodecError::InvalidParameter {
-                name: "width*height*components",
-                value: samples as i64,
-                allowed: "product <= 805306368 samples (3<<28)",
-            });
+        if height != 0 {
+            check_frame_size(width, height, usize::from(nf))?;
         }
 
         // Component specs: [Ci, sampling (Hi<<4 | Vi), Tqi] per component.
@@ -474,9 +461,12 @@ impl<'a> Decoder<'a> {
                 self.skip(payload_len - 11)?;
                 Ok(())
             }
-            2..=4 => Err(CodecError::Unsupported(format!(
-                "LSE ID={id} (mapping tables) not supported"
+            2 | 3 => Err(CodecError::Unsupported(format!(
+                "LSE ID={id} (mapping table) not supported"
             ))),
+            4 => Err(CodecError::Unsupported(
+                "LSE ID=4 (oversize image dimensions) not supported".into(),
+            )),
             other => Err(CodecError::InvalidData(format!("unknown LSE ID={other}"))),
         }
     }
@@ -627,18 +617,84 @@ impl<'a> Decoder<'a> {
 
     // -- main decode flow --------------------------------------------------
 
-    /// Parse SOI and the marker segments up to the first SOS.
+    /// Parse SOI and the marker segments up to the first SOS, and resolve a
+    /// height that SOF55 left to a DNL segment.
     fn read_header(&mut self) -> Result<Header, CodecError> {
         self.expect_marker(MARKER_SOI)?;
         let mut frame: Option<FrameHeader> = None;
         let mut segments = Segments::default();
         let scan = self.read_segments(&mut frame, &mut segments, 0)?;
-        let frame = frame.ok_or_else(|| CodecError::InvalidData("missing SOF55 marker".into()))?;
+        let mut frame =
+            frame.ok_or_else(|| CodecError::InvalidData("missing SOF55 marker".into()))?;
+        let dnl = frame.height == 0;
+        if dnl {
+            frame.height = self.find_dnl_height()?;
+            check_frame_size(frame.width, frame.height, frame.components)?;
+        }
         Ok(Header {
             frame,
             segments,
             scan,
+            dnl,
         })
+    }
+
+    /// The frame height from the DNL segment that ends the first scan, read
+    /// ahead of decoding it, as CharLS does.
+    ///
+    /// Scan data never holds `0xFF` followed by a byte of `0x80` or more, so
+    /// the first such pair after the scan header, other than fill bytes and
+    /// restart markers, starts the next segment, which must be the DNL (T.81
+    /// B.2.5). Its line count is 2, 3 or 4 bytes (T.87 C.2.6). CharLS gives
+    /// up at a restart marker instead, so it cannot read DNL with restarts.
+    fn find_dnl_height(&self) -> Result<usize, CodecError> {
+        let data = &self.data[self.pos..];
+        let not_found = || {
+            CodecError::InvalidData(
+                "SOF55 height is 0 but no DNL segment ends the first scan".into(),
+            )
+        };
+        let mut i = 0;
+        while i + 1 < data.len() {
+            let code = data[i + 1];
+            if data[i] != 0xFF || code < 0x80 || code == 0xFF || (0xD0..=0xD7).contains(&code) {
+                i += 1;
+                continue;
+            }
+            if u16::from_be_bytes([0xFF, code]) != MARKER_DNL {
+                break;
+            }
+            let length = data
+                .get(i + 2..i + 4)
+                .map(|l| usize::from(u16::from_be_bytes([l[0], l[1]])))
+                .ok_or_else(not_found)?;
+            if !(4..=6).contains(&length) {
+                return Err(CodecError::InvalidData(format!(
+                    "DNL segment length {length} invalid (2, 3 or 4 line-count bytes)"
+                )));
+            }
+            let lines = data.get(i + 4..i + 2 + length).ok_or_else(not_found)?;
+            let height = lines.iter().fold(0usize, |h, &b| h << 8 | usize::from(b));
+            if height == 0 {
+                return Err(CodecError::InvalidData(
+                    "DNL line count must be non-zero".into(),
+                ));
+            }
+            return Ok(height);
+        }
+        Err(not_found())
+    }
+
+    /// Consume the DNL segment `find_dnl_height` read, after the first scan.
+    fn skip_dnl(&mut self) -> Result<(), CodecError> {
+        self.skip_zero_padding();
+        let (marker, length) = self.read_marker()?;
+        if marker != MARKER_DNL {
+            return Err(CodecError::InvalidData(format!(
+                "expected DNL (0xFFDC) after the first scan, got 0x{marker:04X}"
+            )));
+        }
+        self.skip(length)
     }
 
     fn decode(
@@ -736,7 +792,7 @@ impl<'a> Decoder<'a> {
         let first = header.scan;
         let mut segments = header.segments.clone();
         let (w, h, nf) = (frame.width, frame.height, frame.components);
-        // w*h*nf cannot overflow: read_sof caps it at MAX_SAMPLES.
+        // w*h*nf cannot overflow: check_frame_size caps it at MAX_SAMPLES.
         let plane = w * h;
         let mut samples = vec![0u16; plane * nf];
         let mut decoded = vec![false; nf];
@@ -793,6 +849,9 @@ impl<'a> Decoder<'a> {
                 component_near[t] = scan.near as u8;
             }
             self.pos = scan_start + consumed;
+            if header.dnl && done == 0 {
+                self.skip_dnl()?;
+            }
             done += ns;
             if done == nf {
                 break;
@@ -952,6 +1011,30 @@ fn scan_targets(component_ids: &[u8], decoded: &[bool], selectors: &[u8]) -> Vec
 fn is_other_sof(marker: u16) -> bool {
     matches!(marker, 0xFFC0..=0xFFCF if !matches!(marker, 0xFFC4 | 0xFFC8 | 0xFFCC))
         || marker == 0xFFF9
+}
+
+/// Reject degenerate or oversized frames before any large allocation. T.87
+/// permits up to 65535 lines per SOF55 axis (more through DNL); the pixel and
+/// sample products are capped so a crafted header cannot request a
+/// multi-GiB buffer.
+fn check_frame_size(width: usize, height: usize, components: usize) -> Result<(), CodecError> {
+    let pixels = width.checked_mul(height).filter(|&n| n <= MAX_PIXELS);
+    let Some(pixels) = pixels else {
+        return Err(CodecError::InvalidParameter {
+            name: "width*height",
+            value: (width as i64).saturating_mul(height as i64),
+            allowed: "product <= 268435456 pixels (1<<28)",
+        });
+    };
+    let samples = pixels.saturating_mul(components);
+    if samples > MAX_SAMPLES {
+        return Err(CodecError::InvalidParameter {
+            name: "width*height*components",
+            value: samples as i64,
+            allowed: "product <= 805306368 samples (3<<28)",
+        });
+    }
+    Ok(())
 }
 
 /// Validate MAXVAL / NEAR / threshold ordering (T.87 C.2.4.1.1) for a scan and
@@ -1432,16 +1515,157 @@ mod tests {
 
     #[test]
     fn sof_zero_dimension_rejected() {
-        // height = 0, width = 4 -> reject before allocation.
-        let mut out: Vec<u8> = vec![0xFF, 0xD8, 0xFF, 0xF7];
-        out.extend_from_slice(&11u16.to_be_bytes());
-        out.push(8);
-        out.extend_from_slice(&0u16.to_be_bytes()); // height
-        out.extend_from_slice(&4u16.to_be_bytes()); // width
-        out.extend_from_slice(&[1, 1, 0x11, 0x00]);
+        // width = 0 -> reject before allocation; height = 0 with no DNL
+        // segment to give it -> reject too.
+        let sof = |height: u16, width: u16| {
+            let mut out: Vec<u8> = vec![0xFF, 0xD8, 0xFF, 0xF7];
+            out.extend_from_slice(&11u16.to_be_bytes());
+            out.push(8);
+            out.extend_from_slice(&height.to_be_bytes());
+            out.extend_from_slice(&width.to_be_bytes());
+            out.extend_from_slice(&[1, 1, 0x11, 0x00]);
+            out
+        };
         assert!(matches!(
-            decode(&out, 4, 0),
+            decode(&sof(4, 0), 0, 4),
             Err(CodecError::InvalidData(_))
+        ));
+        let (buf, _) = encode_mono_4x4();
+        let mut no_dnl = buf.clone();
+        let at = nth_marker(&buf, 0xF7, 0) + 5;
+        no_dnl[at..at + 2].copy_from_slice(&0u16.to_be_bytes());
+        assert!(matches!(
+            decode_image(&no_dnl),
+            Err(CodecError::InvalidData(_))
+        ));
+    }
+
+    /// `stream` with the SOF55 height set to 0 and a DNL segment carrying
+    /// `lines` in `bytes` bytes inserted before the marker that ends the
+    /// first scan (the second SOS, or EOI).
+    fn with_dnl(stream: &[u8], lines: u32, bytes: usize) -> Vec<u8> {
+        let mut out = stream.to_vec();
+        let at = nth_marker(stream, 0xF7, 0) + 5;
+        out[at..at + 2].copy_from_slice(&0u16.to_be_bytes());
+        let end = (0..stream.len() - 1)
+            .skip(nth_marker(stream, 0xDA, 0) + 2)
+            .find(|&i| stream[i] == 0xFF && matches!(stream[i + 1], 0xDA | 0xD9))
+            .unwrap();
+        let mut dnl = vec![0xFF, 0xDC, 0x00, 2 + bytes as u8];
+        dnl.extend_from_slice(&lines.to_be_bytes()[4 - bytes..]);
+        out.splice(end..end, dnl);
+        out
+    }
+
+    #[test]
+    fn dnl_gives_the_height() {
+        // T.87 C.2.6: SOF55 height 0, a DNL segment after the first scan
+        // carries it, in 2, 3 or 4 bytes; `decode` checks the resolved height.
+        let (w, h) = (13usize, 9usize);
+        let pixels = textured(w, h, 255);
+        let mut mono = Vec::new();
+        encode_with_options(
+            &pixels,
+            w as u32,
+            h as u32,
+            &EncodeOptions::default(),
+            &mut mono,
+        )
+        .unwrap();
+        for bytes in 2..=4 {
+            let s = with_dnl(&mono, h as u32, bytes);
+            let img = decode_image(&s).unwrap_or_else(|e| panic!("{bytes}-byte DNL: {e}"));
+            assert_eq!(
+                (img.width, img.height, img.samples),
+                (w as u32, h as u32, pixels.clone())
+            );
+            assert_eq!(decode(&s, w as u32, h as u32).unwrap().0, pixels);
+        }
+
+        // Planar RGB: the DNL ends the first of three scans.
+        let planes: Vec<u16> = (0..3).flat_map(|c| textured(w, h, 200 + c)).collect();
+        let mut rgb = Vec::new();
+        encode_image(
+            &planes,
+            w as u32,
+            h as u32,
+            3,
+            &EncodeOptions::default(),
+            &mut rgb,
+        )
+        .unwrap();
+        assert_eq!(
+            decode_image(&with_dnl(&rgb, h as u32, 2)).unwrap().samples,
+            planes
+        );
+
+        // Restart markers inside the first scan: the look-ahead passes them
+        // (CharLS stops at the first and fails).
+        let restarts = restart_stream(&pixels, w, h, 2, |k| 0xD0 + (k % 8) as u8);
+        assert_eq!(
+            decode_image(&with_dnl(&restarts, h as u32, 2))
+                .unwrap()
+                .samples,
+            pixels
+        );
+    }
+
+    #[test]
+    fn dnl_errors() {
+        let (w, h) = (13usize, 9usize);
+        let pixels = textured(w, h, 255);
+        let mut mono = Vec::new();
+        encode_with_options(
+            &pixels,
+            w as u32,
+            h as u32,
+            &EncodeOptions::default(),
+            &mut mono,
+        )
+        .unwrap();
+        let invalid = |s: &[u8], what: &str| {
+            assert!(
+                matches!(decode_image(s), Err(CodecError::InvalidData(_))),
+                "{what}: {:?}",
+                decode_image(s)
+            );
+        };
+        invalid(&with_dnl(&mono, 0, 2), "zero line count");
+        let mut long = with_dnl(&mono, h as u32, 4);
+        let dnl = nth_marker(&long, 0xDC, 0);
+        long[dnl + 3] = 7; // 5 line-count bytes
+        invalid(&long, "DNL length");
+        // More lines than the scan holds: the decoder meets the DNL mid-scan.
+        assert!(decode_image(&with_dnl(&mono, h as u32 + 3, 2)).is_err());
+        // Fewer: the scan does not end at the DNL.
+        assert!(decode_image(&with_dnl(&mono, h as u32 - 2, 2)).is_err());
+        // The first marker after the first scan must be the DNL: here it ends
+        // the second scan of three instead.
+        let planes: Vec<u16> = (0..3).flat_map(|c| textured(w, h, 200 + c)).collect();
+        let mut rgb = Vec::new();
+        encode_image(
+            &planes,
+            w as u32,
+            h as u32,
+            3,
+            &EncodeOptions::default(),
+            &mut rgb,
+        )
+        .unwrap();
+        let moved = with_dnl(&rgb, h as u32, 2);
+        let dnl = nth_marker(&moved, 0xDC, 0);
+        let segment: Vec<u8> = moved[dnl..dnl + 6].to_vec();
+        let mut late: Vec<u8> = [&moved[..dnl], &moved[dnl + 6..]].concat();
+        let second_end = nth_marker(&late, 0xDA, 2);
+        late.splice(second_end..second_end, segment);
+        invalid(&late, "DNL after the second scan");
+        // The DNL is still bounded by the pixel cap.
+        let mut wide = with_dnl(&mono, 0x00FF_FFFF, 3);
+        let at = nth_marker(&wide, 0xF7, 0) + 7;
+        wide[at..at + 2].copy_from_slice(&0xFFFFu16.to_be_bytes());
+        assert!(matches!(
+            decode_image(&wide),
+            Err(CodecError::InvalidParameter { .. })
         ));
     }
 
@@ -2041,6 +2265,7 @@ mod tests {
                 ilv: 0,
                 selectors: [1, 0, 0, 0],
             },
+            dnl: false,
         };
         assert_eq!(
             ContextModel::scaled_thresholds(7, 0),
