@@ -10,16 +10,42 @@ precision `2..=16`, for:
 
 - **Single-component** images (`Nf = 1`) — `encode` / `decode`, and
   `encode_image` / `decode_image`.
-- **Multi-component planar** images (`ILV = 0`: a shared frame header, then one
-  scan per component, e.g. RGB) — `encode_image` / `decode_image`.
-  `decode_image` accepts 1 or 3 components; `encode_image` writes any count.
+- **3-component** images (e.g. RGB) — `decode_image`, in all three interleave
+  modes: one scan per component (`ILV = 0`), one line-interleaved scan
+  (`ILV = 1`, DCMTK's default for colour) or one sample-interleaved scan
+  (`ILV = 2`). `encode_image` writes `ILV = 0`, for any component count.
 
-Rejected: line- and sample-interleaved scans (`ILV = 1/2`), restart markers
-inside a scan (`RSTn`), LSE mapping tables, and component subsampling
-(`Unsupported`); a non-zero point transform or an impossible scan component
-count (`InvalidData`). A `DRI` segment on its own is tolerated and skipped.
-Interop is verified against **CharLS** `.jls` fixtures (including an
-LSE-bearing stream).
+Rejected as `Unsupported`: restart markers inside a scan (`RSTn`), LSE mapping
+tables, component subsampling, a scan covering only some of the remaining
+components (mixed interleave), NEAR differing between scans, and HP colour
+transforms. Rejected as `InvalidData`: a non-zero point transform, an
+impossible scan component count, or an interleave mode that does not fit it.
+A `DRI` segment on its own is tolerated and skipped.
+
+Interop is verified bit-exactly against the **ITU-T T.87 conformance**
+streams (HP encoder), **CharLS** test streams and **DCMTK** (`dcmcjpls`)
+output — see `tests/fixtures/`.
+
+### Compatibility notes
+
+Like CharLS, the decoder accepts these deviations found in real files:
+
+- `0x00` bytes, or `0xFF` fill bytes, between a scan and the next marker
+  (DCMTK pads odd-length streams as `FF FF D9`; CharLS #365 cites `00 FF D9`
+  in DICOM samples);
+- LSE, COM, APPn and DRI segments between the scans of a planar image (an LSE
+  there applies to the scans after it);
+- an LSE `RESET` of 0, meaning the default (64), as for the other fields;
+- a non-zero SOF `Tq` or SOS `Ah`, both of which JPEG-LS leaves unused.
+
+An APP8 `"mrfx"` segment (HP colour transform, written by the HP codec and
+CharLS) is rejected rather than ignored, since ignoring it would decode the
+wrong colours. Other APP8 segments, such as a SPIFF header, are skipped.
+
+Where CharLS departs from T.87 the decoder follows T.87: a `RESET` above 255
+is used as written (CharLS truncates it to 8 bits), and an LSE `MAXVAL` sets
+`RANGE` / `LIMIT` / `qbpp` (CharLS derives those from the sample precision).
+DCMTK never writes either case.
 
 ### Profiles
 
@@ -36,7 +62,7 @@ Near-lossless and explicit precision are set through `EncodeOptions` via
 - **Context-based adaptive prediction** with Median Edge Detection (MED)
 - **Golomb-Rice entropy coding** with adaptive parameter selection
 - **Run-length mode** for efficient coding of uniform regions
-- **Grayscale and planar multi-component** (e.g. RGB, `ILV = 0`) images,
+- **Grayscale and 3-component** (e.g. RGB) images in every interleave mode,
   precision `2..=16`
 - **DICOS/DICOM compatible**: Transfer Syntax `1.2.840.10008.1.2.4.80`
 - **Pure Rust**: No external codec dependencies
@@ -73,11 +99,12 @@ let (decoded, width, height) = decode(&compressed, 16, 16).unwrap();
 assert_eq!(decoded, pixels);
 ```
 
-### Planar multi-component (e.g. RGB)
+### Multi-component (e.g. RGB)
 
 `encode_image` / `decode_image` take and return **component-planar** samples
-(all of component 0, then component 1, …). `decode_image` reads the geometry
-from the codestream and returns it with the frame metadata.
+(all of component 0, then component 1, …), whatever the interleave mode of the
+stream. `decode_image` reads the geometry from the codestream and returns it
+with the frame metadata, including the stream's `interleave_mode`.
 
 ```rust
 use jpegls::{decode_image, encode_image, EncodeOptions};
@@ -129,7 +156,7 @@ selection, allowing the codec to adapt to local image characteristics.
 | Pixel Type | Precision | Components | Description |
 |------------|-----------|------------|-------------|
 | `u16` | `2..=16` bits | 1 (`Nf = 1`, `ILV = 0`) | single-component grayscale |
-| `u16` | `2..=16` bits | 3 (`Nf = 3`, `ILV = 0`) | planar multi-component, e.g. RGB (`encode_image` writes any `Nf`) |
+| `u16` | `2..=16` bits | 3 (`Nf = 3`, `ILV = 0/1/2`) | multi-component, e.g. RGB; decoded to planar samples (`encode_image` writes `ILV = 0`, any `Nf`) |
 
 ## JPEG-LS Stream Format
 
@@ -140,9 +167,10 @@ SOF55 - Start of Frame, JPEG-LS (0xFFF7)
 LSE   - JPEG-LS Preset Parameters (0xFFF8, optional)
         Custom MAXVAL, T1, T2, T3, RESET thresholds
 SOS   - Start of Scan (0xFFDA)
-        Component selector, Near parameter (0 = lossless)
+        Component selector(s), Near parameter (0 = lossless), ILV
 [entropy-coded image data]
-(SOS + scan repeat once per component for planar, ILV = 0, multi-component)
+(ILV = 0 multi-component: SOS + scan repeat once per component;
+ ILV = 1/2: one SOS + scan covers every component)
 EOI   - End of Image (0xFFD9)
 ```
 

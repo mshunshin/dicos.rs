@@ -3,7 +3,8 @@
 //! Run mode is entered from the regular scan loop whenever all three local
 //! gradients are within `NEAR` (T.87 A.7). This module holds:
 //! - the run-length coding (A.7.1) and run-interruption coding (A.7.2), wired
-//!   into both scan loops via [`encode_run`] / [`decode_run`];
+//!   into both scan loops via [`encode_run`] / [`decode_run`], plus the
+//!   sample-interleaved (ILV 2) decoder [`decode_run_sample`];
 //! - the shared error mapping (A.5.2), near-lossless quantization/modulo
 //!   (A.4.4/A.4.5), and reconstruction (A.4.6) helpers used by regular mode
 //!   too, so the encoder and decoder cannot drift.
@@ -186,6 +187,16 @@ fn interruption_params(ra: i32, rb: i32, near: i32) -> (usize, i32, i32) {
     }
 }
 
+/// Run-interruption parameters for one component of a sample-interleaved
+/// (ILV 2) pixel: RItype 0 for every component, `Px = Rb`, and a sign that is
+/// `-1` only when `Ra > Rb`. Unlike [`interruption_params`], `Ra == Rb` is
+/// possible here (another component ended the run), and then the sign is `+1`.
+/// This matches CharLS and the HP-encoded T.87 conformance streams.
+#[inline]
+fn sample_interruption_params(ra: i32, rb: i32) -> (usize, i32, i32) {
+    (0, rb, if ra > rb { -1 } else { 1 })
+}
+
 /// Run-interruption error-mapping predicate `map` (T.87 code segment A.21).
 #[inline]
 fn run_map(err: i32, k: i32, nn: i32, n: i32) -> bool {
@@ -222,15 +233,14 @@ fn encode_run_interruption<W: Write>(
     ))
 }
 
-/// Decode one run-interruption sample (A.7.2); returns the reconstructed value.
+/// Decode one run-interruption sample (A.7.2) with the given `(RItype, Px,
+/// sign)`; returns the reconstructed value.
 fn decode_run_interruption(
     br: &mut BitReader<'_>,
     ctx: &mut ContextModel,
-    ra: i32,
-    rb: i32,
+    (ri_type, px, s): (usize, i32, i32),
 ) -> Result<i32, CodecError> {
     let near = ctx.near;
-    let (ri_type, px, s) = interruption_params(ra, rb, near);
     let ctx_idx = RUN_CTX_BASE + ri_type;
 
     let k = ctx.compute_k_run(ri_type);
@@ -331,8 +341,46 @@ pub(crate) fn decode_run(
     }
 
     let rb = prev[end + 1];
-    let recon = decode_run_interruption(br, ctx, ra, rb)?;
+    let recon = decode_run_interruption(br, ctx, interruption_params(ra, rb, ctx.near))?;
     cur[end + 1] = recon;
+    ctx.decrement_run_index();
+    Ok(end + 1)
+}
+
+/// Decode a sample-interleaved (ILV 2) run starting at logical sample `start`
+/// of every component; returns the next sample.
+///
+/// `cur`/`prev` hold one offset-1 line buffer per component (at most 4). The
+/// run is shared: one run length and one `RUNindex` for the pixel, each
+/// component filled with its own `Ra`. An interruption codes every component
+/// in turn (see [`sample_interruption_params`]), all with the `RUNindex` in
+/// force before the single decrement that follows.
+pub(crate) fn decode_run_sample(
+    br: &mut BitReader<'_>,
+    ctx: &mut ContextModel,
+    cur: &mut [Vec<i32>],
+    prev: &[Vec<i32>],
+    start: usize,
+    width: usize,
+) -> Result<usize, CodecError> {
+    let mut ra = [0i32; 4];
+    for (slot, line) in ra.iter_mut().zip(cur.iter()) {
+        *slot = line[start];
+    }
+
+    let run_length = decode_run_pixels(br, ctx, width - start)?;
+    let end = start + run_length;
+    for (line, &value) in cur.iter_mut().zip(&ra) {
+        line[start + 1..end + 1].fill(value);
+    }
+    if end == width {
+        return Ok(end);
+    }
+
+    for ((line, above), &value) in cur.iter_mut().zip(prev).zip(&ra) {
+        let params = sample_interruption_params(value, above[end + 1]);
+        line[end + 1] = decode_run_interruption(br, ctx, params)?;
+    }
     ctx.decrement_run_index();
     Ok(end + 1)
 }
@@ -372,6 +420,17 @@ mod tests {
         assert_eq!(quantize(-3, 2), -1);
         assert_eq!(quantize(7, 2), 1);
         assert_eq!(quantize(8, 2), 2);
+    }
+
+    #[test]
+    fn sample_interruption_uses_ritype_0_and_positive_sign_on_ties() {
+        // Ra == Rb happens in ILV 2 when another component ended the run; the
+        // sign is +1 there, unlike interruption_params's Ra != Rb branch.
+        assert_eq!(sample_interruption_params(40, 40), (0, 40, 1));
+        assert_eq!(sample_interruption_params(40, 90), (0, 90, 1));
+        assert_eq!(sample_interruption_params(90, 40), (0, 40, -1));
+        // Single-component mode picks RItype 1 for the tie instead.
+        assert_eq!(interruption_params(40, 40, 0), (1, 40, 1));
     }
 
     #[test]
