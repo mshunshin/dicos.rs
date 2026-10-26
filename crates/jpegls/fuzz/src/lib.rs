@@ -60,7 +60,7 @@ pub fn samples_from(body: &[u8], n: usize, mask: u32) -> Vec<u16> {
 /// A valid `encode_image` request described by fuzz bytes. Every input maps to
 /// one, so a target built on it spends no time on rejected requests:
 ///
-/// - byte 0: component count (bit 0: 1 or 3);
+/// - byte 0: component count `1 + (b % 4)`, i.e. `1..=4`;
 /// - byte 1: precision `2 + (b % 15)`, i.e. `2..=16`;
 /// - bytes 2, 3: width and height, `1 + (b % 64)`;
 /// - byte 4: NEAR — 0 unless the top bit is set, then bounded by
@@ -87,7 +87,7 @@ impl ImageSpec {
         if data.len() < Self::HEADER_LEN {
             return None;
         }
-        let components: u8 = if data[0] & 1 == 1 { 3 } else { 1 };
+        let components: u8 = 1 + data[0] % 4;
         let precision: u8 = 2 + data[1] % 15;
         let width = 1 + u32::from(data[2] % 64);
         let height = 1 + u32::from(data[3] % 64);
@@ -134,16 +134,12 @@ impl ImageSpec {
 }
 
 /// Assert the [`jpegls::DecodedImage`] contract for a stream the decoder
-/// accepted: 1 or 3 components, interleave mode `0..=2` (always 0 for one
-/// component), precision `2..=16`, exactly `width * height * components`
+/// accepted: at least one component, interleave mode `0..=2` (always 0 for
+/// one component), precision `2..=16`, exactly `width * height * components`
 /// samples, and no sample above `max_sample` (`2^P - 1`, or the LSE MAXVAL
 /// when the caller knows a preset applies).
 pub fn assert_image_contract(img: &jpegls::DecodedImage, max_sample: Option<u32>) {
-    assert!(
-        img.components == 1 || img.components == 3,
-        "components = {}",
-        img.components
-    );
+    assert!(img.components >= 1, "components = {}", img.components);
     assert!(img.interleave_mode <= 2, "interleave_mode = {}", img.interleave_mode);
     if img.components == 1 {
         assert_eq!(img.interleave_mode, 0, "a single component is never interleaved");
