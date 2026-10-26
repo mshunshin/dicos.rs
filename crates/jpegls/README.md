@@ -18,16 +18,20 @@ precision `2..=16`, for:
   (falling back to frame order when those are unusable, as CharLS ignores
   them). `encode_image` writes `ILV = 0`, for any component count.
 
+Each scan may carry its own NEAR, as T.87 allows: `DecodedImage::near` is the
+largest (a bound on every sample) and `DecodedImage::component_near` gives each
+component's.
+
 Restart markers (`DRI` + `RSTm`) are decoded, every interval starting from
 fresh statistics as CharLS does, and so are HP colour transforms HP1–HP3
 (APP8 `"mrfx"`; three lossless 8- or 16-bit components in an interleaved scan,
 CharLS 3.0's rule).
 
-Rejected as `Unsupported`: LSE mapping tables, component subsampling, NEAR
-differing between scans, and the HP lossy / matrix transforms (4, 5). Rejected
-as `InvalidData`: a non-zero point transform, an impossible scan component
-count, an interleave mode that does not fit it, an HP transform where it cannot
-apply, and a missing or out-of-sequence `RSTm`.
+Rejected as `Unsupported`: LSE mapping tables, component subsampling, and the
+HP lossy / matrix transforms (4, 5). Rejected as `InvalidData`: a non-zero
+point transform, an impossible scan component count, an interleave mode that
+does not fit it, an HP transform where it cannot apply (including any scan
+with a non-zero NEAR), and a missing or out-of-sequence `RSTm`.
 
 Interop is verified bit-exactly against the **ITU-T T.87 conformance**
 streams (HP encoder), **CharLS** test streams and CharLS-encoded images
