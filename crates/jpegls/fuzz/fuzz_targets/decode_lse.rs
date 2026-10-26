@@ -12,9 +12,13 @@
 //! finding:
 //!
 //! - the [`jpegls::DecodedImage`] contract, with no sample above the
-//!   *effective* MAXVAL (the preset's, when it sets one) — plus NEAR when that
-//!   preset is below `2^P - 1`, where the CharLS-coding retry may apply;
-//! - the frame and scan fields come back as written;
+//!   *effective* MAXVAL (the preset's, when it sets one) — plus its
+//!   component's NEAR when that preset is below `2^P - 1`, where the
+//!   CharLS-coding retry may apply;
+//! - the frame and scan fields come back as written, each component's NEAR
+//!   included — this and the sample bound only for the first component when
+//!   the scan bytes hold an LSE or SOS segment of their own, which the
+//!   decoder applies to the scans after it, as CharLS does;
 //! - the accepted preset obeys the rules the decoder documents: MAXVAL within
 //!   the SOF precision, RESET 0 (the default) or `3..=max(255, MAXVAL)`,
 //!   NEAR <= min(255, MAXVAL/2);
@@ -24,7 +28,8 @@
 //!
 //! - byte 0: flags — bit 0 three components; bit 1 an APPn segment first;
 //!   bit 2 a DRI segment; bit 3 the LSE after SOF55; bit 4 raw LSE fields;
-//!   bit 5 an over-long LSE;
+//!   bit 5 an over-long LSE; bit 6 a NEAR per scan (`NEAR >> c` for
+//!   component `c`, so the first scan's is the largest);
 //! - byte 1: precision `2 + (b % 15)`;
 //! - bytes 2, 3: width and height, `1 + (b % 32)`;
 //! - byte 4: NEAR — 0 unless the top bit is set, then the low 7 bits;
@@ -50,6 +55,9 @@ fuzz_target!(|data: &[u8]| {
     let height = 1 + u16::from(input.u8() % 32);
     let b = input.u8();
     let near: u8 = if b & 0x80 == 0 { 0 } else { b & 0x7f };
+    let component_near: Vec<u8> = (0..nf)
+        .map(|c| if flags & 0x40 != 0 { near >> c } else { near })
+        .collect();
     let raw = [
         input.u16(),
         input.u16(),
@@ -115,7 +123,7 @@ fuzz_target!(|data: &[u8]| {
     }
     cuts.push(body.len());
     for c in 0..usize::from(nf) {
-        segment(&mut stream, 0xDA, &[1, c as u8 + 1, 0, near, 0, 0]);
+        segment(&mut stream, 0xDA, &[1, c as u8 + 1, 0, component_near[c], 0, 0]);
         stream.extend_from_slice(&body[cuts[c]..cuts[c + 1]]);
     }
     stream.extend_from_slice(&[0xFF, 0xD9]);
@@ -144,24 +152,50 @@ fuzz_target!(|data: &[u8]| {
         "accepted NEAR {near} above min(255, MAXVAL/2) for MAXVAL {effective_max}"
     );
     // A preset MAXVAL below 2^P - 1 may decode through the CharLS-coding
-    // retry, where samples can exceed MAXVAL by up to NEAR, exactly as CharLS
-    // decodes them (and never by more).
-    let sample_max = if effective_max < sof_max {
-        (effective_max + u32::from(near)).min(sof_max)
-    } else {
-        effective_max
+    // retry, where samples can exceed MAXVAL by up to their component's NEAR,
+    // exactly as CharLS decodes them (and never by more).
+    let sample_max = |near: u8| {
+        if effective_max < sof_max {
+            (effective_max + u32::from(near)).min(sof_max)
+        } else {
+            effective_max
+        }
     };
-    assert_image_contract(&img, Some(sample_max));
+    // Fuzz bytes may themselves hold an LSE or SOS segment, and the scans
+    // after it then run under its preset or NEAR: only the first scan
+    // (component 0) is sure to run under the header's.
+    let foreign = body
+        .windows(2)
+        .any(|p| p == [0xFF, 0xF8] || p == [0xFF, 0xDA]);
+    let known = if foreign { 1 } else { usize::from(nf) };
+    assert_image_contract(&img, Some(if foreign { sof_max } else { sample_max(near) }));
+    let plane = usize::from(width) * usize::from(height);
+    for (c, samples) in img.samples.chunks(plane).enumerate().take(known) {
+        let max = sample_max(component_near[c]);
+        assert!(
+            samples.iter().all(|&s| u32::from(s) <= max),
+            "component {c}: a sample exceeds {max}"
+        );
+    }
     assert_eq!(
         (
             img.width,
             img.height,
             img.components,
             img.bits_per_sample,
-            img.near
+            &img.component_near[..known]
         ),
-        (u32::from(width), u32::from(height), nf, precision, near),
+        (
+            u32::from(width),
+            u32::from(height),
+            nf,
+            precision,
+            &component_near[..known]
+        ),
         "frame or scan fields changed"
     );
+    if !foreign {
+        assert_eq!(img.near, near, "near is not the first scan's NEAR");
+    }
     assert_decode_agrees(&stream, &img);
 });

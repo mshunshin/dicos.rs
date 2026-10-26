@@ -129,7 +129,14 @@ impl Coding {
         let presets = &header.segments.presets;
         let sof_max_val = (1i32 << header.frame.precision) - 1;
         let max_val = presets.maxval.unwrap_or(sof_max_val);
+        // NEAR is per scan, so only a frame coded in one scan is known to use
+        // the first scan's; otherwise any NEAR the frame allows may follow.
         let near = header.scan.near;
+        let nears = if header.scan.components == header.frame.components {
+            near..=near
+        } else {
+            0..=(max_val / 2).min(255)
+        };
         let mut retries = Vec::new();
         if presets.maxval.is_some_and(|m| m != sof_max_val) {
             retries.push(Coding::CharLsMaxval);
@@ -138,8 +145,10 @@ impl Coding {
             && presets.t2.is_none()
             && presets.t3.is_none()
             && max_val < 128
-            && ContextModel::scaled_thresholds(max_val, near)
-                != ContextModel::default_thresholds(max_val, near)
+            && nears.into_iter().any(|n| {
+                ContextModel::scaled_thresholds(max_val, n)
+                    != ContextModel::default_thresholds(max_val, n)
+            })
         {
             retries.push(Coding::CharLs1Thresholds);
         }
@@ -194,8 +203,13 @@ pub struct DecodedImage {
     /// (later scans may differ). Informational only: [`Self::samples`] is
     /// planar in every mode.
     pub interleave_mode: u8,
-    /// NEAR error bound (0 = lossless).
+    /// NEAR error bound (0 = lossless): the largest NEAR of any scan, so every
+    /// sample is within ±`near` of the source. T.87 keeps NEAR per scan;
+    /// [`Self::component_near`] has each component's.
     pub near: u8,
+    /// NEAR of the scan that coded each component, in SOF55 order (length
+    /// `components`).
+    pub component_near: Vec<u8>,
 }
 
 /// Decode a JPEG-LS bitstream, reading the geometry from the codestream.
@@ -682,7 +696,13 @@ impl<'a> Decoder<'a> {
     /// succeeds wins, and otherwise the T.87 error is returned.
     fn decode_frame(&mut self, header: Header) -> Result<DecodedImage, CodecError> {
         if header.segments.transform != 0 {
-            check_transform(header.segments.transform, &header.frame, &header.scan)?;
+            let scan = &header.scan;
+            check_transform(
+                header.segments.transform,
+                &header.frame,
+                scan.ilv,
+                scan.near,
+            )?;
         }
         let start = self.pos;
         let error = match self.decode_scans(&header, Coding::T87) {
@@ -720,18 +740,12 @@ impl<'a> Decoder<'a> {
         let plane = w * h;
         let mut samples = vec![0u16; plane * nf];
         let mut decoded = vec![false; nf];
+        let mut component_near = vec![0u8; nf];
 
         let mut scan = first;
         let mut done = 0usize;
         loop {
-            if scan.near != first.near {
-                // Legal (T.87 keeps NEAR per scan), but DecodedImage carries a
-                // single bound.
-                return Err(CodecError::Unsupported(format!(
-                    "per-scan NEAR differs across components ({} then {})",
-                    first.near, scan.near
-                )));
-            }
+            // Validates NEAR <= min(255, MAXVAL/2) for this scan.
             let ctx = scan_context(&frame, &segments.presets, scan.near, coding)?;
             let ns = scan.components;
             let targets = scan_targets(&segments.component_ids, &decoded, &scan.selectors[..ns]);
@@ -776,6 +790,7 @@ impl<'a> Decoder<'a> {
             }
             for &t in &targets {
                 decoded[t] = true;
+                component_near[t] = scan.near as u8;
             }
             self.pos = scan_start + consumed;
             done += ns;
@@ -787,8 +802,9 @@ impl<'a> Decoder<'a> {
         }
         self.expect_eoi()?;
 
+        let near = component_near.iter().copied().max().unwrap_or(0);
         if segments.transform != 0 {
-            check_transform(segments.transform, &frame, &first)?;
+            check_transform(segments.transform, &frame, first.ilv, i32::from(near))?;
             inverse_hp_transform(&mut samples, segments.transform, frame.precision);
         }
 
@@ -799,7 +815,8 @@ impl<'a> Decoder<'a> {
             bits_per_sample: frame.precision as u8,
             components: nf as u8,
             interleave_mode: first.ilv,
-            near: first.near as u8,
+            near,
+            component_near,
         })
     }
 }
@@ -838,17 +855,17 @@ fn scan_context(
 }
 
 /// Check an HP colour transform can apply, by CharLS 3.0's rule: three
-/// components of 8 or 16 bits, coded lossless in an interleaved scan.
+/// components of 8 or 16 bits, coded lossless in an interleaved scan. `ilv` is
+/// the first scan's interleave mode; `near` the largest NEAR of the scans
+/// read so far (CharLS checks only the first scan's, but the transform is
+/// lossless-only whichever scan carries the error).
 fn check_transform(
     transform: u8,
     frame: &FrameHeader,
-    first: &ScanHeader,
+    ilv: u8,
+    near: i32,
 ) -> Result<(), CodecError> {
-    if frame.components == 3
-        && matches!(frame.precision, 8 | 16)
-        && first.near == 0
-        && first.ilv != 0
-    {
+    if frame.components == 3 && matches!(frame.precision, 8 | 16) && near == 0 && ilv != 0 {
         Ok(())
     } else {
         Err(CodecError::InvalidData(format!(
@@ -1953,16 +1970,88 @@ mod tests {
     }
 
     #[test]
-    fn near_differing_across_scans_unsupported() {
-        // Legal in T.87, but DecodedImage carries a single NEAR.
-        let planes: Vec<Vec<u16>> = (0..3).map(|c| vec![c * 40; 16]).collect();
-        let rgb = build_planar_rgb(&planes, 4, 4, 8);
-        let mut mixed = rgb.clone();
-        mixed[nth_marker(&rgb, 0xDA, 1) + 7] = 1; // second scan's NEAR
+    fn near_may_differ_across_scans() {
+        // T.87 keeps NEAR per scan: planar scans at NEAR 0, 2 and 5 each
+        // decode exactly as the same scan does alone.
+        let (w, h) = (16usize, 12usize);
+        let nears = [0i32, 2, 5];
+        let planes: Vec<Vec<u16>> = (0..3).map(|c| textured(w, h, 255 - 40 * c)).collect();
+        let mut out: Vec<u8> = vec![0xFF, 0xD8, 0xFF, 0xF7, 0x00, 17, 8];
+        out.extend_from_slice(&(h as u16).to_be_bytes());
+        out.extend_from_slice(&(w as u16).to_be_bytes());
+        out.push(3);
+        for c in 1..=3u8 {
+            out.extend_from_slice(&[c, 0x11, 0x00]);
+        }
+        let mut alone = Vec::new();
+        for (c, (plane, &near)) in planes.iter().zip(&nears).enumerate() {
+            let ctx = ContextModel::new(255, near, DEFAULT_RESET);
+            out.extend_from_slice(&[0xFF, 0xDA, 0x00, 8, 1, c as u8 + 1, 0, near as u8, 0, 0]);
+            encode_scan_t87(&mut out, plane, w, h, ctx.clone()).unwrap();
+            let single = stream_with_ctx(8, plane, w, h, None, ctx);
+            alone.extend(decode_image(&single).unwrap().samples);
+        }
+        out.extend_from_slice(&[0xFF, 0xD9]);
+
+        let img = decode_image(&out).expect("per-scan NEAR");
+        assert_eq!(img.samples, alone);
+        assert_eq!(
+            (img.near, img.component_near.as_slice()),
+            (5, &[0, 2, 5][..])
+        );
+        for ((got, want), near) in img.samples.chunks(w * h).zip(&planes).zip(nears) {
+            assert!(got
+                .iter()
+                .zip(want)
+                .all(|(g, s)| i32::from(g.abs_diff(*s)) <= near));
+        }
+    }
+
+    #[test]
+    fn hp_transform_needs_every_scan_lossless() {
+        // The end-of-frame check sees the largest NEAR of all scans.
+        let frame = FrameHeader {
+            precision: 8,
+            height: 1,
+            width: 1,
+            components: 3,
+        };
+        assert!(check_transform(1, &frame, 1, 0).is_ok());
         assert!(matches!(
-            decode_image(&mixed),
-            Err(CodecError::Unsupported(_))
+            check_transform(1, &frame, 1, 2),
+            Err(CodecError::InvalidData(_))
         ));
+    }
+
+    #[test]
+    fn charls1_retry_considers_every_near_a_later_scan_may_use() {
+        // At 3 bits the CharLS 1.x and T.87 thresholds agree for NEAR 0 but
+        // not for NEAR 1, which a later scan of a planar frame may carry.
+        let header = |components: usize| Header {
+            frame: FrameHeader {
+                precision: 3,
+                height: 1,
+                width: 1,
+                components,
+            },
+            segments: Segments::default(),
+            scan: ScanHeader {
+                near: 0,
+                components: 1,
+                ilv: 0,
+                selectors: [1, 0, 0, 0],
+            },
+        };
+        assert_eq!(
+            ContextModel::scaled_thresholds(7, 0),
+            ContextModel::default_thresholds(7, 0)
+        );
+        assert_ne!(
+            ContextModel::scaled_thresholds(7, 1),
+            ContextModel::default_thresholds(7, 1)
+        );
+        assert!(Coding::retries(&header(1)).is_empty());
+        assert_eq!(Coding::retries(&header(2)), [Coding::CharLs1Thresholds]);
     }
 
     #[test]

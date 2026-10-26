@@ -264,6 +264,63 @@ fn mixed_interleave_spliced_from_dcmtk_scans() {
 }
 
 #[test]
+fn near_per_scan_spliced_from_dcmtk_scans() {
+    // Nf = 6 coded as two of DCMTK's 3-component scans of one image, one
+    // lossless and one at NEAR 2 (T.87 keeps NEAR per scan). Neither stream
+    // has an LSE, so each scan decodes as it did alone and `dcmdjpls`'s
+    // output stays the bit-exact expectation.
+    let Some(dir) = fixture_dir("dcmtk") else {
+        return;
+    };
+    for ilv in [1u8, 2] {
+        let lossless = format!("mixed-37x24-8-rgb-ilv{ilv}");
+        let lossy = format!("{lossless}-near2");
+        let read = |stem: &str| {
+            let scan = scan_segment(&std::fs::read(dir.join(format!("{stem}.jls"))).unwrap());
+            let reference = read_pnm(&dir.join(format!("{stem}.ppm")));
+            let planes: Vec<u16> = (0..3)
+                .flat_map(|c| reference.samples.iter().skip(c).step_by(3).copied())
+                .collect();
+            (scan, planes, reference.width, reference.height)
+        };
+        let (lossless_scan, lossless_planes, w, h) = read(&lossless);
+        let (lossy_scan, lossy_planes, ..) = read(&lossy);
+
+        let mut frame = vec![0xFF, 0xD8, 0xFF, 0xF7, 0x00, 26, 8];
+        frame.extend_from_slice(&(h as u16).to_be_bytes());
+        frame.extend_from_slice(&(w as u16).to_be_bytes());
+        frame.push(6);
+        for id in 1..=6u8 {
+            frame.extend_from_slice(&[id, 0x11, 0x00]);
+        }
+        let splice = |scans: [Vec<u8>; 2]| {
+            let mut s = frame.clone();
+            s.extend(scans.concat());
+            s.extend_from_slice(&[0xFF, 0xD9]);
+            jpegls::decode_image(&s).unwrap_or_else(|e| panic!("ILV {ilv}: {e}"))
+        };
+        let in_frame_order = [lossless_planes, lossy_planes].concat();
+
+        // Lossless scan first, then the NEAR 2 scan; and the other way round,
+        // where the selectors still place the lossy scan's components last.
+        for img in [
+            splice([
+                with_selectors(&lossless_scan, &[1, 2, 3]),
+                with_selectors(&lossy_scan, &[4, 5, 6]),
+            ]),
+            splice([
+                with_selectors(&lossy_scan, &[4, 5, 6]),
+                with_selectors(&lossless_scan, &[1, 2, 3]),
+            ]),
+        ] {
+            assert_eq!(img.samples, in_frame_order, "ILV {ilv}");
+            assert_eq!(img.component_near, [0, 0, 0, 2, 2, 2], "ILV {ilv}");
+            assert_eq!(img.near, 2, "ILV {ilv}");
+        }
+    }
+}
+
+#[test]
 fn charls_generated_streams() {
     // Streams CharLS (via pillow-jpls) encoded, with CharLS's own decode as
     // the expectation: four components in each interleave mode, the SPIFF
@@ -536,7 +593,8 @@ fn feature_caps_lists_every_capability() {
             "mixed-ilv",
             "restart",
             "hp-transform",
-            "charls-retry"
+            "charls-retry",
+            "near-per-scan"
         ]
     );
 }

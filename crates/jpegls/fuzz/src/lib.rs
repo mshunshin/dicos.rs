@@ -135,15 +135,22 @@ impl ImageSpec {
 
 /// Assert the [`jpegls::DecodedImage`] contract for a stream the decoder
 /// accepted: at least one component, interleave mode `0..=2` (always 0 for
-/// one component), precision `2..=16`, exactly `width * height * components`
-/// samples, and no sample above `max_sample` (`2^P - 1`, or the LSE MAXVAL
-/// when the caller knows a preset applies).
+/// one component), one NEAR per component with `near` the largest, precision
+/// `2..=16`, exactly `width * height * components` samples, and no sample
+/// above `max_sample` (`2^P - 1`, or the LSE MAXVAL when the caller knows a
+/// preset applies).
 pub fn assert_image_contract(img: &jpegls::DecodedImage, max_sample: Option<u32>) {
     assert!(img.components >= 1, "components = {}", img.components);
     assert!(img.interleave_mode <= 2, "interleave_mode = {}", img.interleave_mode);
     if img.components == 1 {
         assert_eq!(img.interleave_mode, 0, "a single component is never interleaved");
     }
+    assert_eq!(img.component_near.len(), usize::from(img.components));
+    assert_eq!(
+        img.component_near.iter().copied().max(),
+        Some(img.near),
+        "near is not the largest component NEAR"
+    );
     assert!(
         (2..=16).contains(&img.bits_per_sample),
         "bits_per_sample = {}",
