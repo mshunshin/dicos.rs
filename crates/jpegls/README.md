@@ -187,6 +187,33 @@ assert_eq!((img.width, img.height, img.components), (w, h, 3));
 assert_eq!(img.samples, planar);
 ```
 
+### Header only, and decoding into your own buffer
+
+`read_header` returns a stream's `ImageInfo` (width, height, precision,
+component count, interleave mode, and the NEAR of every component) without
+decoding the samples. It reads and checks every marker segment as a decode
+would, including those between later scans, and skips over the entropy-coded
+data, which costs 1–3% of a decode on the test streams. Only errors in the
+coded data itself are left for the decode to find.
+
+`decode_image_into` decodes into a buffer you supply, sized from
+`ImageInfo::sample_count`, and allocates no image of its own. It writes `u16`
+samples, or `u8` for images of up to 8 bits, either pixel-interleaved
+(`Layout::Interleaved`: `RGBRGB…`, DICOM Planar Configuration 0) or
+component-planar (`Layout::Planar`, as `decode_image` returns). A buffer of the
+wrong length (`DimensionMismatch`) or `u8` for a deeper image
+(`InvalidParameter`) is refused before anything is written.
+
+```rust
+use jpegls::{decode_image_into, read_header, Layout};
+
+let info = read_header(&rgb).unwrap();
+assert_eq!((info.width, info.height, info.components), (16, 16, 3));
+assert!(info.bits_per_sample <= 8);
+let mut pixels = vec![0u8; info.sample_count()]; // RGBRGB…
+decode_image_into(&rgb, &mut pixels, Layout::Interleaved).unwrap();
+```
+
 ## JPEG-LS Algorithm
 
 JPEG-LS uses the LOCO-I (LOw COmplexity LOssless COmpression for Images) algorithm:
@@ -248,7 +275,8 @@ EOI   - End of Image (0xFFD9)
 
 ```
 jpegls/src/
-  lib.rs        # Public API (encode, decode, encode_image, decode_image, TRANSFER_SYNTAX_UID)
+  lib.rs        # Public API (encode, decode, encode_image, decode_image, read_header,
+                #   decode_image_into, TRANSFER_SYNTAX_UID)
   encode.rs     # Encoder: prediction + context + Golomb-Rice output
   decode.rs     # Decoder: Golomb-Rice input + context + reconstruction
   predictor.rs  # MED predictor and gradient computation
