@@ -228,12 +228,12 @@ pub fn encode_image(
 
     write_marker(w, MARKER_SOI)?;
     write_sof(w, precision as u8, height as u16, width as u16, components)?;
-    // One SOS + entropy scan per component (ILV 0). Each scan gets a fresh
-    // context, as the decoder expects.
-    for c in 0..components as usize {
-        write_sos(w, 1, opts.near)?;
+    // One SOS + entropy scan per component (ILV 0), each selecting its own
+    // component. Each scan gets a fresh context, as the decoder expects.
+    for (c, plane_samples) in samples.chunks_exact(plane).enumerate() {
+        write_sos(w, c as u8 + 1, opts.near)?;
         let ctx = ContextModel::new(max_val, near, DEFAULT_RESET);
-        encode_scan_t87(w, &samples[c * plane..(c + 1) * plane], wu, hu, ctx)?;
+        encode_scan_t87(w, plane_samples, wu, hu, ctx)?;
     }
     write_marker(w, MARKER_EOI)?;
 
@@ -373,19 +373,17 @@ fn write_sof(
     Ok(())
 }
 
-fn write_sos(w: &mut dyn Write, components: u8, near: u8) -> Result<(), CodecError> {
+/// Write an `ILV = 0` SOS for the one component whose SOF55 id is
+/// `component_id` (`write_sof` numbers them from 1).
+fn write_sos(w: &mut dyn Write, component_id: u8, near: u8) -> Result<(), CodecError> {
     write_marker(w, MARKER_SOS)?;
 
-    // Length: 2 + 1(Ns) + Ns*2 + 3
-    let length: u16 = 6 + u16::from(components) * 2;
-    w.write_all(&length.to_be_bytes())?;
+    // Length: 2 + 1(Ns) + Ns*2 + 3, with Ns = 1
+    w.write_all(&8u16.to_be_bytes())?;
 
-    w.write_all(&[components])?;
-
-    for i in 0..components {
-        w.write_all(&[i + 1])?; // Component ID
-        w.write_all(&[0x00])?; // Mapping table selector
-    }
+    w.write_all(&[1])?; // Ns
+    w.write_all(&[component_id])?; // Component selector
+    w.write_all(&[0x00])?; // Mapping table selector
 
     w.write_all(&[near])?; // Near
     w.write_all(&[0x00])?; // ILV = 0
@@ -468,6 +466,34 @@ mod tests {
             encode_with_options(&pixels, 65536, 1, &EncodeOptions::default(), &mut buf),
             Err(CodecError::InvalidParameter { name: "width", .. })
         ));
+    }
+
+    #[test]
+    fn encode_image_scans_select_their_own_component() {
+        // SOF55 numbers the components 1..=Nf; scan c must select id c + 1.
+        for components in [1u8, 3, 255] {
+            let pixels = vec![7u16; 2 * usize::from(components)];
+            let mut buf = Vec::new();
+            encode_image(
+                &pixels,
+                2,
+                1,
+                components,
+                &EncodeOptions::default(),
+                &mut buf,
+            )
+            .unwrap();
+            let selectors: Vec<u8> = buf
+                .windows(2)
+                .enumerate()
+                .filter(|(_, p)| *p == [0xFF, 0xDA])
+                .map(|(i, _)| {
+                    assert_eq!(&buf[i + 2..i + 5], &[0x00, 0x08, 1], "Ls = 8, Ns = 1");
+                    buf[i + 5]
+                })
+                .collect();
+            assert_eq!(selectors, (1..=components).collect::<Vec<_>>());
+        }
     }
 
     #[test]

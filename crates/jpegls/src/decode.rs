@@ -364,6 +364,14 @@ impl<'a> Decoder<'a> {
 
     /// Parse SOF55, returning the frame header and the component ids `Ci`.
     fn read_sof(&mut self, payload_len: usize) -> Result<(FrameHeader, Vec<u8>), CodecError> {
+        // P(1) + Y(2) + X(2) + Nf(1), checked first so a short segment cannot
+        // take its fields from the next marker.
+        if payload_len < 6 {
+            return Err(CodecError::InvalidData(format!(
+                "SOF55 segment too short ({} bytes)",
+                payload_len + 2
+            )));
+        }
         let p = self.read_byte()?;
         if !(2..=16).contains(&p) {
             return Err(CodecError::InvalidParameter {
@@ -391,6 +399,14 @@ impl<'a> Decoder<'a> {
                 "SOF55 component count must be non-zero".into(),
             ));
         }
+        // Lf = 8 + 3*Nf exactly (T.87 C.2.2), as CharLS requires.
+        if payload_len != 6 + 3 * usize::from(nf) {
+            return Err(CodecError::InvalidData(format!(
+                "SOF55 length {} does not match Nf = {nf} (expected {})",
+                payload_len + 2,
+                8 + 3 * usize::from(nf)
+            )));
+        }
         if height != 0 {
             check_frame_size(width, height, usize::from(nf))?;
         }
@@ -398,10 +414,18 @@ impl<'a> Decoder<'a> {
         // Component specs: [Ci, sampling (Hi<<4 | Vi), Tqi] per component.
         // Require 1:1 sampling (no subsampling); otherwise the scan would be
         // mis-decoded. Tqi is reserved in JPEG-LS and ignored, as CharLS does
-        // (mapping tables are selected per scan, in SOS).
+        // (mapping tables are selected per scan, in SOS). Each Ci must be
+        // unique (T.81 B.2.2), as CharLS also requires: a scan selector could
+        // not say which of two equal ids it means.
         let mut ids = Vec::with_capacity(usize::from(nf));
         for _ in 0..nf {
-            ids.push(self.read_byte()?);
+            let id = self.read_byte()?;
+            if ids.contains(&id) {
+                return Err(CodecError::InvalidData(format!(
+                    "duplicate SOF55 component id {id}"
+                )));
+            }
+            ids.push(id);
             let sampling = self.read_byte()?;
             let _tq = self.read_byte()?;
             if sampling != 0x11 {
@@ -409,11 +433,6 @@ impl<'a> Decoder<'a> {
                     "JPEG-LS component sampling {sampling:#04x} not supported (must be 1:1 = 0x11)"
                 )));
             }
-        }
-        // Skip any trailing bytes in an over-long segment (payload is 6 + Nf*3).
-        let consumed = 6 + nf as usize * 3;
-        if payload_len > consumed {
-            self.skip(payload_len - consumed)?;
         }
 
         let header = FrameHeader {
@@ -978,22 +997,17 @@ fn inverse_hp_transform(samples: &mut [u16], transform: u8, precision: u32) {
 /// When every selector `Csj` names a distinct SOF component that no earlier
 /// scan decoded, the scan goes where its selectors say (T.87 C.2.3), so scans
 /// may come in any order. Otherwise — an unknown, repeated or already used
-/// selector, or duplicate SOF ids — it takes the next undecoded components in
-/// frame order: CharLS ignores the selectors altogether, so streams with
-/// arbitrary ones decode there and must decode here too.
+/// selector — it takes the next undecoded components in frame order: CharLS
+/// ignores the selectors altogether, so streams with arbitrary ones decode
+/// there and must decode here too. The SOF ids are unique (`read_sof`).
 fn scan_targets(component_ids: &[u8], decoded: &[bool], selectors: &[u8]) -> Vec<usize> {
     let by_selector: Option<Vec<usize>> = selectors
         .iter()
         .map(|&cs| {
-            let mut matches = component_ids
+            component_ids
                 .iter()
-                .enumerate()
-                .filter(|&(_, &id)| id == cs)
-                .map(|(i, _)| i);
-            match (matches.next(), matches.next()) {
-                (Some(i), None) if !decoded[i] => Some(i),
-                _ => None,
-            }
+                .position(|&id| id == cs)
+                .filter(|&i| !decoded[i])
         })
         .collect();
     match by_selector {
@@ -2083,6 +2097,56 @@ mod tests {
         with_dht.extend_from_slice(&[0xFF, 0xC4, 0x00, 0x04, 0x00, 0x00]);
         with_dht.extend_from_slice(&buf[2..]);
         assert_eq!(decode(&with_dht, 4, 4).expect("DHT skipped").0, pixels);
+    }
+
+    #[test]
+    fn sof_length_must_match_component_count() {
+        // Lf must be exactly 8 + 3*Nf: a short segment must not read its
+        // fields from the next marker, and a long one is malformed too.
+        let (mono, _) = encode_mono_4x4();
+        let sof = nth_marker(&mono, 0xF7, 0);
+        assert_eq!(&mono[sof + 2..sof + 4], &[0, 11]);
+        for lf in [2u8, 5, 8, 10, 12] {
+            let mut bad = mono.clone();
+            bad[sof + 3] = lf;
+            for result in [
+                decode(&bad, 4, 4).map(|_| ()),
+                decode_image(&bad).map(|_| ()),
+            ] {
+                assert!(
+                    matches!(result, Err(CodecError::InvalidData(_))),
+                    "Lf = {lf}: {result:?}"
+                );
+            }
+        }
+        let plane: Vec<u16> = (0..16).collect();
+        let rgb = build_planar_rgb(&[plane.clone(), plane.clone(), plane], 4, 4, 8);
+        let sof = nth_marker(&rgb, 0xF7, 0);
+        assert_eq!(&rgb[sof + 2..sof + 4], &[0, 17]);
+        for lf in [16u8, 18] {
+            let mut bad = rgb.clone();
+            bad[sof + 3] = lf;
+            assert!(
+                matches!(decode_image(&bad), Err(CodecError::InvalidData(_))),
+                "Lf = {lf}"
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_sof_component_ids_rejected() {
+        // Ci must be unique; any repeat is malformed, whichever pair it is.
+        let plane: Vec<u16> = (0..20).collect();
+        let rgb = build_planar_rgb(&[plane.clone(), plane.clone(), plane], 5, 4, 8);
+        let sof = nth_marker(&rgb, 0xF7, 0);
+        for (a, b) in [(0, 1), (0, 2), (1, 2)] {
+            let mut dup = rgb.clone();
+            dup[sof + 10 + 3 * b] = dup[sof + 10 + 3 * a];
+            match decode_image(&dup) {
+                Err(CodecError::InvalidData(m)) => assert!(m.contains("component id"), "{m}"),
+                other => panic!("ids {a} and {b}: {:?}", other.map(|_| ())),
+            }
+        }
     }
 
     #[test]
