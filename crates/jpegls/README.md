@@ -31,8 +31,8 @@ A frame whose SOF55 height is 0 takes its height from the DNL segment that
 ends the first scan (2, 3 or 4 bytes, T.87 C.2.6), as CharLS 3.0 reads it; the
 decoder finds the DNL before decoding, passing any restart markers.
 
-Rejected as `InvalidData`: a non-zero point transform, an impossible scan
-component count, an interleave mode that does not fit it, an HP transform
+Rejected as `InvalidData`: duplicate SOF component ids, a non-zero point
+transform, an impossible scan component count, an interleave mode that does not fit it, an HP transform
 where it cannot apply (including any scan with a non-zero NEAR), a missing or
 out-of-sequence `RSTm`, and a height of 0 with no DNL to give it. What is
 rejected as `Unsupported` is listed under [Not supported](#not-supported).
