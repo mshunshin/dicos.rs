@@ -306,6 +306,16 @@ impl<'a> Decoder<'a> {
             b = self.read_byte()?;
         }
         let marker = 0xFF00u16 | u16::from(b);
+        // 0xFF then a byte below 0x80 is scan data (the encoder stuffs a zero
+        // bit after every 0xFF), never a marker, and an RSTm belongs inside a
+        // scan with restart intervals, where the scan decoder reads it. CharLS
+        // rejects both here too. Skipping them as segments would read a
+        // length that is not there.
+        if b < 0x80 || (0xD0..=0xD7).contains(&b) {
+            return Err(CodecError::InvalidData(format!(
+                "0x{marker:04X} where a marker segment should start"
+            )));
+        }
 
         let length = self.read_u16be()? as usize;
         // Length field includes its own 2 bytes.
@@ -2691,6 +2701,39 @@ mod tests {
         assert_eq!(img.components, 1);
         assert_eq!((img.width, img.height), (w, h));
         assert_eq!(img.samples, pixels);
+    }
+
+    fn rgb_planes(w: usize, h: usize) -> Vec<Vec<u16>> {
+        (0..3)
+            .map(|c| {
+                textured(w, h, 255)
+                    .iter()
+                    .map(|&v| (v + c * 60) % 256)
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn non_markers_between_scans_rejected() {
+        // 0xFF then a byte below 0x80 is not a marker, and an RSTm belongs
+        // inside a scan. Read as segments, they used to be skipped by their
+        // "length", which could hide a marker, here an EOI, behind them.
+        let rgb = build_planar_rgb(&rgb_planes(5, 4), 5, 4, 8);
+        let second = nth_marker(&rgb, 0xDA, 1);
+        for junk in [
+            &[0xFF, 0x00, 0x00, 0x04, 0xFF, 0xD9][..],
+            &[0xFF, 0x7F, 0x00, 0x02],
+            &[0xFF, 0xD0, 0x00, 0x02],
+        ] {
+            let mut s = rgb[..second].to_vec();
+            s.extend_from_slice(junk);
+            s.extend_from_slice(&rgb[second..]);
+            assert!(
+                matches!(decode_image(&s), Err(CodecError::InvalidData(_))),
+                "{junk:02X?}"
+            );
+        }
     }
 
     #[test]
