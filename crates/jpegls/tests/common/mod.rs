@@ -5,24 +5,25 @@
 
 use std::path::Path;
 
-/// A binary PGM (`P5`) or PPM (`P6`) image.
+/// A binary PGM (`P5`), PPM (`P6`) or PAM (`P7`) image.
 pub struct Pnm {
     pub width: u32,
     pub height: u32,
-    /// 1 for PGM, 3 for PPM.
+    /// 1 for PGM, 3 for PPM, `DEPTH` for PAM.
     pub components: usize,
     pub maxval: u32,
     /// Pixel-interleaved samples (`RGBRGB…` for PPM), row-major.
     pub samples: Vec<u16>,
 }
 
-/// Read a binary PGM/PPM, 8-bit or 16-bit big-endian (maxval > 255).
+/// Read a binary PGM/PPM/PAM, 8-bit or 16-bit big-endian (maxval > 255).
 pub fn read_pnm(path: &Path) -> Pnm {
     let d = std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     let components = match &d[..2] {
         b"P5" => 1,
         b"P6" => 3,
-        other => panic!("{}: not a binary PGM/PPM ({other:?})", path.display()),
+        b"P7" => return read_pam(path, &d),
+        other => panic!("{}: not a binary PGM/PPM/PAM ({other:?})", path.display()),
     };
     let mut i = 2usize;
     let mut toks = Vec::new();
@@ -67,6 +68,48 @@ pub fn read_pnm(path: &Path) -> Pnm {
         width,
         height,
         components,
+        maxval,
+        samples,
+    }
+}
+
+/// Read the PAM (`P7`) header lines up to `ENDHDR`, then the samples.
+fn read_pam(path: &Path, d: &[u8]) -> Pnm {
+    let end = d
+        .windows(7)
+        .position(|w| w == b"ENDHDR\n")
+        .unwrap_or_else(|| panic!("{}: PAM without ENDHDR", path.display()));
+    let header = std::str::from_utf8(&d[..end]).unwrap();
+    let field = |key: &str| -> u32 {
+        header
+            .lines()
+            .find_map(|l| l.strip_prefix(key)?.trim().parse().ok())
+            .unwrap_or_else(|| panic!("{}: PAM {key} missing", path.display()))
+    };
+    let (width, height, depth, maxval) = (
+        field("WIDTH"),
+        field("HEIGHT"),
+        field("DEPTH"),
+        field("MAXVAL"),
+    );
+    let body = &d[end + 7..];
+    let samples: Vec<u16> = if maxval > 255 {
+        body.chunks(2)
+            .map(|c| u16::from_be_bytes([c[0], c[1]]))
+            .collect()
+    } else {
+        body.iter().map(|&b| u16::from(b)).collect()
+    };
+    assert_eq!(
+        samples.len(),
+        (width * height * depth) as usize,
+        "{}: sample count",
+        path.display()
+    );
+    Pnm {
+        width,
+        height,
+        components: depth as usize,
         maxval,
         samples,
     }

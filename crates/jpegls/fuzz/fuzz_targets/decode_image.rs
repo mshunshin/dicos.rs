@@ -7,7 +7,7 @@
 //! `Err` is an acceptable rejection. A panic, or an `Ok` that breaks one of
 //! the invariants below, is a finding:
 //!
-//! - 1 or 3 components, interleave mode `0..=2` (0 for one component),
+//! - at least one component, interleave mode `0..=2` (0 for one component),
 //!   precision `2..=16`;
 //! - exactly `width * height * components` samples, none above `2^P - 1`;
 //! - a single-component stream decodes identically through `jpegls::decode`.

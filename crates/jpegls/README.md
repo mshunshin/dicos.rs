@@ -10,21 +10,37 @@ precision `2..=16`, for:
 
 - **Single-component** images (`Nf = 1`) — `encode` / `decode`, and
   `encode_image` / `decode_image`.
-- **3-component** images (e.g. RGB) — `decode_image`, in all three interleave
-  modes: one scan per component (`ILV = 0`), one line-interleaved scan
-  (`ILV = 1`, DCMTK's default for colour) or one sample-interleaved scan
-  (`ILV = 2`). `encode_image` writes `ILV = 0`, for any component count.
+- **Multi-component** images (1 to 255 components, e.g. RGB, RGBA) —
+  `decode_image`, in all three interleave modes: one scan per component
+  (`ILV = 0`), line-interleaved scans (`ILV = 1`, DCMTK's default for colour)
+  or sample-interleaved scans (`ILV = 2`), up to four components per scan and
+  in any mix across the frame. Scans are placed by their component selectors
+  (falling back to frame order when those are unusable, as CharLS ignores
+  them). `encode_image` writes `ILV = 0`, for any component count.
 
-Rejected as `Unsupported`: restart markers inside a scan (`RSTn`), LSE mapping
-tables, component subsampling, a scan covering only some of the remaining
-components (mixed interleave), NEAR differing between scans, and HP colour
-transforms. Rejected as `InvalidData`: a non-zero point transform, an
-impossible scan component count, or an interleave mode that does not fit it.
-A `DRI` segment on its own is tolerated and skipped.
+Each scan may carry its own NEAR, as T.87 allows: `DecodedImage::near` is the
+largest (a bound on every sample) and `DecodedImage::component_near` gives each
+component's.
+
+Restart markers (`DRI` + `RSTm`) are decoded, every interval starting from
+fresh statistics as CharLS does, and so are HP colour transforms HP1–HP3
+(APP8 `"mrfx"`; three lossless 8- or 16-bit components in an interleaved scan,
+CharLS 3.0's rule).
+
+A frame whose SOF55 height is 0 takes its height from the DNL segment that
+ends the first scan (2, 3 or 4 bytes, T.87 C.2.6), as CharLS 3.0 reads it; the
+decoder finds the DNL before decoding, passing any restart markers.
+
+Rejected as `InvalidData`: a non-zero point transform, an impossible scan
+component count, an interleave mode that does not fit it, an HP transform
+where it cannot apply (including any scan with a non-zero NEAR), a missing or
+out-of-sequence `RSTm`, and a height of 0 with no DNL to give it. What is
+rejected as `Unsupported` is listed under [Not supported](#not-supported).
 
 Interop is verified bit-exactly against the **ITU-T T.87 conformance**
-streams (HP encoder), **CharLS** test streams and **DCMTK** (`dcmcjpls`)
-output — see `tests/fixtures/`.
+streams (HP encoder), **CharLS** test streams and CharLS-encoded images
+(four components, SPIFF headers, presets), and **DCMTK** (`dcmcjpls`) output
+— see `tests/fixtures/`.
 
 ### Compatibility notes
 
@@ -38,14 +54,63 @@ Like CharLS, the decoder accepts these deviations found in real files:
 - an LSE `RESET` of 0, meaning the default (64), as for the other fields;
 - a non-zero SOF `Tq` or SOS `Ah`, both of which JPEG-LS leaves unused.
 
-An APP8 `"mrfx"` segment (HP colour transform, written by the HP codec and
-CharLS) is rejected rather than ignored, since ignoring it would decode the
-wrong colours. Other APP8 segments, such as a SPIFF header, are skipped.
+APP8 segments other than `"mrfx"`, such as CharLS's SPIFF header, are
+skipped.
 
-Where CharLS departs from T.87 the decoder follows T.87: a `RESET` above 255
-is used as written (CharLS truncates it to 8 bits), and an LSE `MAXVAL` sets
-`RANGE` / `LIMIT` / `qbpp` (CharLS derives those from the sample precision).
-DCMTK never writes either case.
+Two CharLS codings differ from T.87, and files using them exist. A stream
+that fails under T.87 is decoded again under each one its header allows; a
+stream that decodes under T.87 is never reinterpreted:
+
+- **CharLS 1.x default thresholds** (the copy bundled in DCMTK and others):
+  for MAXVAL < 128 it used the MAXVAL >= 128 formula (CharLS #51) and wrote no
+  LSE. DCMTK's `dcmcjpls +pc` produces such 6- and 7-bit streams.
+- **CharLS's LSE MAXVAL**: CharLS derives `RANGE`, `LIMIT` and `qbpp` from the
+  sample precision and uses an LSE `MAXVAL` only for the default thresholds,
+  where T.87 derives all of them from `MAXVAL`. Any CharLS stream with an LSE
+  `MAXVAL` below `2^P - 1` is coded this way. Decoded as CharLS does, a
+  near-lossless sample may exceed `MAXVAL` by up to `NEAR`; a reading with any
+  sample beyond that is rejected, since no CharLS encoder produces one.
+
+Where CharLS departs from T.87 in a way that cannot be told apart, the decoder
+follows T.87: a `RESET` above 255 is used as written (CharLS truncates it to 8
+bits; DCMTK refuses to write one).
+
+A caution for producers rather than a decoder rule: CharLS releases built before
+commit 3790e10 (April 2023; e.g. the CharLS 2.4 inside pillow-jpls 1.3.2) are
+not lossless for **four-component, sample-interleaved** images — a pixel that
+differs from its left neighbour only in the 4th component (e.g. alpha) is coded
+as part of a run, and that change is lost. Every decoder, this one included,
+reproduces the stream as written.
+
+### Not supported
+
+These parts of T.87 are rejected as `Unsupported`. No DICOM producer is known
+to write any of them, and CharLS rejects the first two as well.
+
+- **Component subsampling.** SOF55 gives each component sampling factors H
+  and V (1–4); a component's plane is the image width × H / max H by height ×
+  V / max V, as for YCbCr 4:2:0 chroma. Only `H = V = 1` is accepted, because
+  `DecodedImage` holds equal-sized planes. The T.87 conformance streams
+  `t8sse0` / `t8sse3` are the only known examples.
+- **HP colour transforms 4 (lossy) and 5 (matrix).** HP1–HP3 are decoded.
+- **Mapping tables (palettised images).** The coded samples are indices into a
+  table: LSE ID 2 defines one (a table ID, bytes per entry, entries), LSE ID 3
+  continues it, each SOS component names one through its selector `Tm`, and a
+  separate tables-only (abbreviated) stream may carry them. CharLS 3.0 returns
+  the tables without applying them. DICOM keeps a palette in the dataset
+  (`PALETTE COLOR`) and codes the indices as a plain greyscale image, which
+  decodes.
+- **Oversize dimensions.** LSE ID 4 gives a width or height above 65535 (SOF55
+  holds 16 bits). Separately, this decoder caps any frame at `2^28` pixels per
+  plane and `3 × 2^28` samples in all (`InvalidParameter`), so a crafted header
+  cannot demand a multi-GiB buffer.
+- **Other frame types**: JPEG-LS Part 2 (ITU-T T.870 / ISO/IEC 14495-2)
+  frames (SOF57), and the frame markers of ordinary JPEG (SOF0–SOF15), a
+  different codec. LSE IDs above 4, which only Part 2 defines, are
+  `InvalidData`.
+
+The encoder writes the common subset only: one `ILV = 0` scan per component,
+default presets (no LSE), and no restart markers, DNL or colour transform.
 
 ### Profiles
 
@@ -62,8 +127,8 @@ Near-lossless and explicit precision are set through `EncodeOptions` via
 - **Context-based adaptive prediction** with Median Edge Detection (MED)
 - **Golomb-Rice entropy coding** with adaptive parameter selection
 - **Run-length mode** for efficient coding of uniform regions
-- **Grayscale and 3-component** (e.g. RGB) images in every interleave mode,
-  precision `2..=16`
+- **Grayscale and multi-component** (e.g. RGB, RGBA) images in every
+  interleave mode, precision `2..=16`
 - **DICOS/DICOM compatible**: Transfer Syntax `1.2.840.10008.1.2.4.80`
 - **Pure Rust**: No external codec dependencies
 
@@ -156,7 +221,7 @@ selection, allowing the codec to adapt to local image characteristics.
 | Pixel Type | Precision | Components | Description |
 |------------|-----------|------------|-------------|
 | `u16` | `2..=16` bits | 1 (`Nf = 1`, `ILV = 0`) | single-component grayscale |
-| `u16` | `2..=16` bits | 3 (`Nf = 3`, `ILV = 0/1/2`) | multi-component, e.g. RGB; decoded to planar samples (`encode_image` writes `ILV = 0`, any `Nf`) |
+| `u16` | `2..=16` bits | 2-255 (`ILV = 0/1/2`, mixed) | multi-component, e.g. RGB, RGBA; decoded to planar samples (`encode_image` writes `ILV = 0`, any `Nf`) |
 
 ## JPEG-LS Stream Format
 
@@ -169,8 +234,10 @@ LSE   - JPEG-LS Preset Parameters (0xFFF8, optional)
 SOS   - Start of Scan (0xFFDA)
         Component selector(s), Near parameter (0 = lossless), ILV
 [entropy-coded image data]
-(ILV = 0 multi-component: SOS + scan repeat once per component;
- ILV = 1/2: one SOS + scan covers every component)
+DNL   - Define Number of Lines (0xFFDC, optional: only after the first scan,
+        when SOF55 gives the height as 0)
+(multi-component: SOS + scan repeat until every component is covered —
+ one component per ILV = 0 scan, up to four per ILV = 1/2 scan)
 EOI   - End of Image (0xFFD9)
 ```
 

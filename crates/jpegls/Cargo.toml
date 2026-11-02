@@ -12,7 +12,11 @@ keywords = ["jpeg-ls", "jpeg", "lossless", "codec", "compression"]
 categories = ["compression", "multimedia::images"]
 # Third-party test streams (CharLS/HP conformance, BSD-3) and DCMTK-generated
 # fixtures stay in the repository; tests/fixtures.rs skips when they are absent.
-exclude = ["tests/fixtures/charls", "tests/fixtures/dcmtk"]
+exclude = [
+    "tests/fixtures/charls",
+    "tests/fixtures/charls-gen",
+    "tests/fixtures/dcmtk",
+]
 
 # Published as `pure_jpegls`, imported as `jpegls`.
 [lib]

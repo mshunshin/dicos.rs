@@ -45,6 +45,12 @@ CASES.append(("mixed", 37, 24, 3, 8, ["+il", "+t1", "5", "+t2", "9", "+t3", "30"
 for w, h in [(33, 21), (40, 29)]:
     CASES.append(("mixed", w, h, 1, 16, [], "ilv0"))
     CASES.append(("mixed", w, h, 1, 16, ["+en"], "ilv0-near2"))
+# "Cooked" mode codes P = BitsStored. At 6 and 7 bits DCMTK's CharLS 1.x uses
+# the MAXVAL >= 128 default thresholds (CharLS #51) without writing an LSE.
+for bits in (6, 7):
+    CASES.append(("mixed", 48, 32, 1, bits, ["+pc"], "ilv0-pc"))
+    for flag, ilv in [("+il", 1), ("+is", 2)]:
+        CASES.append(("mixed", 48, 32, 3, bits, ["+pc", flag], f"ilv{ilv}-pc"))
 
 
 def samples(pattern, w, h, spp, bits, seed):
@@ -225,6 +231,9 @@ Colour streams are line-interleaved (`ilv1`, DCMTK's default `+il`) or
 sample-interleaved (`ilv2`, `+is`); DCMTK has no planar option for colour.
 `near2` streams use `+en` (NEAR 2). Images stored with more than 8 bits are
 encoded with P = 16 and an LSE segment, as DCMTK always does above 12 bits.
+`pc` streams use DCMTK's "cooked" encoder (`+pc`), which codes P = BitsStored;
+at 6 and 7 bits its CharLS 1.x picks non-T.87 default thresholds (CharLS #51)
+and writes no LSE, so they decode only through the decoder's CharLS 1.x retry.
 
 These end in DCMTK's extended EOI padding (`FF FF D9`):
 {chr(10).join(f"- `{s}`" for s in fill_padded)}

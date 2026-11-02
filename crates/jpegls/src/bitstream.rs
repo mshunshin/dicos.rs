@@ -71,19 +71,57 @@ impl<'a> BitReader<'a> {
 
     /// Byte offset of the marker terminating the scan.
     ///
-    /// If the final consumed data byte was `0xFF`, its mandatory stuff byte
-    /// (T.87 A.1) may not have been pulled into the accumulator yet; it sits at
-    /// [`Self::pos`] and the marker begins immediately after it.
+    /// Whole bytes still unread in the accumulator (a bulk refill reads up to
+    /// seven bytes ahead) are given back first; a byte after `0xFF` carries
+    /// 7 bits. If the final consumed data byte was `0xFF`, its mandatory stuff
+    /// byte (T.87 A.1) may not have been pulled into the accumulator yet; it
+    /// sits at [`Self::pos`] and the marker begins immediately after it.
     pub fn marker_pos(&self) -> usize {
         if self.last_ff {
-            self.pos + 1
-        } else {
-            self.pos
+            return self.pos + 1;
         }
+        let mut pos = self.pos;
+        let mut unread = self.n_bits;
+        while pos > 0 {
+            let len = if pos >= 2 && self.data[pos - 2] == 0xFF {
+                7
+            } else {
+                8
+            };
+            if unread < len {
+                break;
+            }
+            unread -= len;
+            pos -= 1;
+        }
+        pos
     }
 
     /// Fill the accumulator so it contains at least `n` bits.
+    ///
+    /// Fast path: when none of the next 8 bytes is `0xFF` (so no stuffing and
+    /// no marker among them), load up to 7 of them at once.
     fn fill(&mut self, n: i32) -> Result<(), CodecError> {
+        if !self.last_ff && self.n_bits < n {
+            if let Some(chunk) = self.data.get(self.pos..self.pos + 8) {
+                let word = u64::from_be_bytes(chunk.try_into().unwrap());
+                // SWAR "has a zero byte" on !word: true when a byte is 0xFF.
+                let inverted = !word;
+                let has_ff = inverted.wrapping_sub(0x0101_0101_0101_0101)
+                    & !inverted
+                    & 0x8080_8080_8080_8080;
+                if has_ff == 0 {
+                    let bytes = ((64 - self.n_bits) / 8).min(7);
+                    let bits = 8 * bytes;
+                    self.bits = (self.bits << bits) | (word >> (64 - bits));
+                    self.n_bits += bits;
+                    self.pos += bytes as usize;
+                    if self.n_bits >= n {
+                        return Ok(());
+                    }
+                }
+            }
+        }
         while self.n_bits < n {
             if let Some(m) = self.pending_marker {
                 return Err(CodecError::Marker(m));
