@@ -364,6 +364,14 @@ impl<'a> Decoder<'a> {
 
     /// Parse SOF55, returning the frame header and the component ids `Ci`.
     fn read_sof(&mut self, payload_len: usize) -> Result<(FrameHeader, Vec<u8>), CodecError> {
+        // P(1) + Y(2) + X(2) + Nf(1), checked first so a short segment cannot
+        // take its fields from the next marker.
+        if payload_len < 6 {
+            return Err(CodecError::InvalidData(format!(
+                "SOF55 segment too short ({} bytes)",
+                payload_len + 2
+            )));
+        }
         let p = self.read_byte()?;
         if !(2..=16).contains(&p) {
             return Err(CodecError::InvalidParameter {
@@ -391,6 +399,14 @@ impl<'a> Decoder<'a> {
                 "SOF55 component count must be non-zero".into(),
             ));
         }
+        // Lf = 8 + 3*Nf exactly (T.87 C.2.2), as CharLS requires.
+        if payload_len != 6 + 3 * usize::from(nf) {
+            return Err(CodecError::InvalidData(format!(
+                "SOF55 length {} does not match Nf = {nf} (expected {})",
+                payload_len + 2,
+                8 + 3 * usize::from(nf)
+            )));
+        }
         if height != 0 {
             check_frame_size(width, height, usize::from(nf))?;
         }
@@ -417,11 +433,6 @@ impl<'a> Decoder<'a> {
                     "JPEG-LS component sampling {sampling:#04x} not supported (must be 1:1 = 0x11)"
                 )));
             }
-        }
-        // Skip any trailing bytes in an over-long segment (payload is 6 + Nf*3).
-        let consumed = 6 + nf as usize * 3;
-        if payload_len > consumed {
-            self.skip(payload_len - consumed)?;
         }
 
         let header = FrameHeader {
@@ -2086,6 +2097,40 @@ mod tests {
         with_dht.extend_from_slice(&[0xFF, 0xC4, 0x00, 0x04, 0x00, 0x00]);
         with_dht.extend_from_slice(&buf[2..]);
         assert_eq!(decode(&with_dht, 4, 4).expect("DHT skipped").0, pixels);
+    }
+
+    #[test]
+    fn sof_length_must_match_component_count() {
+        // Lf must be exactly 8 + 3*Nf: a short segment must not read its
+        // fields from the next marker, and a long one is malformed too.
+        let (mono, _) = encode_mono_4x4();
+        let sof = nth_marker(&mono, 0xF7, 0);
+        assert_eq!(&mono[sof + 2..sof + 4], &[0, 11]);
+        for lf in [2u8, 5, 8, 10, 12] {
+            let mut bad = mono.clone();
+            bad[sof + 3] = lf;
+            for result in [
+                decode(&bad, 4, 4).map(|_| ()),
+                decode_image(&bad).map(|_| ()),
+            ] {
+                assert!(
+                    matches!(result, Err(CodecError::InvalidData(_))),
+                    "Lf = {lf}: {result:?}"
+                );
+            }
+        }
+        let plane: Vec<u16> = (0..16).collect();
+        let rgb = build_planar_rgb(&[plane.clone(), plane.clone(), plane], 4, 4, 8);
+        let sof = nth_marker(&rgb, 0xF7, 0);
+        assert_eq!(&rgb[sof + 2..sof + 4], &[0, 17]);
+        for lf in [16u8, 18] {
+            let mut bad = rgb.clone();
+            bad[sof + 3] = lf;
+            assert!(
+                matches!(decode_image(&bad), Err(CodecError::InvalidData(_))),
+                "Lf = {lf}"
+            );
+        }
     }
 
     #[test]
