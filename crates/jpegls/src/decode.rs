@@ -61,6 +61,13 @@ struct FrameHeader {
     components: usize,
 }
 
+impl FrameHeader {
+    /// `width * height * components`, which `check_frame_size` bounds.
+    fn sample_count(&self) -> usize {
+        self.width * self.height * self.components
+    }
+}
+
 #[derive(Clone, Copy)]
 struct ScanHeader {
     near: i32,
@@ -224,7 +231,152 @@ pub struct DecodedImage {
 pub fn decode_image(data: &[u8]) -> Result<DecodedImage, CodecError> {
     let mut dec = Decoder::new(data);
     let header = dec.read_header()?;
-    dec.decode_frame(header)
+    let mut samples = vec![0u16; header.frame.sample_count()];
+    let info = dec.decode_into(&header, &mut samples, Layout::Planar)?;
+    Ok(DecodedImage {
+        samples,
+        width: info.width,
+        height: info.height,
+        bits_per_sample: info.bits_per_sample,
+        components: info.components,
+        interleave_mode: info.interleave_mode,
+        near: info.near,
+        component_near: info.component_near,
+    })
+}
+
+/// A JPEG-LS frame's metadata, from [`read_header`] or [`decode_image_into`].
+/// The fields mean what they do in [`DecodedImage`].
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageInfo {
+    /// Image width in pixels.
+    pub width: u32,
+    /// Image height in pixels (from SOF55, or the DNL segment when SOF55
+    /// leaves it 0).
+    pub height: u32,
+    /// Sample precision in bits (2..=16).
+    pub bits_per_sample: u8,
+    /// Component count (`1..=255`), in SOF55 order.
+    pub components: u8,
+    /// Interleave mode of the first scan: `0` none, `1` line, `2` sample
+    /// (later scans may differ). Informational only: it does not affect the
+    /// output [`Layout`].
+    pub interleave_mode: u8,
+    /// NEAR error bound (0 = lossless): the largest NEAR of any scan, so every
+    /// sample is within ±`near` of the source.
+    pub near: u8,
+    /// NEAR of the scan that coded each component, in SOF55 order (length
+    /// `components`).
+    pub component_near: Vec<u8>,
+}
+
+impl ImageInfo {
+    /// Samples in the decoded image, `width * height * components`: the
+    /// buffer length [`decode_image_into`] needs.
+    pub fn sample_count(&self) -> usize {
+        self.width as usize * self.height as usize * usize::from(self.components)
+    }
+}
+
+/// How [`decode_image_into`] arranges a multi-component image. The two are
+/// the same for one component.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Layout {
+    /// Pixel-interleaved: the components of each pixel together, row by row
+    /// (`RGBRGB…`). DICOM Planar Configuration 0 (colour-by-pixel).
+    Interleaved,
+    /// Component-planar: all of component 0, then all of component 1, …
+    /// (`RRR…GGG…BBB…`), as in [`DecodedImage::samples`]. DICOM Planar
+    /// Configuration 1 (colour-by-plane).
+    Planar,
+}
+
+mod sealed {
+    pub trait Sealed: Copy {
+        /// Bits the type holds.
+        const BITS: u32;
+        /// Narrow a decoded sample, which is within `0..2^BITS`.
+        fn from_sample(v: i32) -> Self;
+        /// Widen a written sample back, for the HP colour transform.
+        fn to_sample(self) -> i32;
+    }
+
+    impl Sealed for u8 {
+        const BITS: u32 = 8;
+        fn from_sample(v: i32) -> Self {
+            v as u8
+        }
+        fn to_sample(self) -> i32 {
+            i32::from(self)
+        }
+    }
+
+    impl Sealed for u16 {
+        const BITS: u32 = 16;
+        fn from_sample(v: i32) -> Self {
+            v as u16
+        }
+        fn to_sample(self) -> i32 {
+            i32::from(self)
+        }
+    }
+}
+
+/// A sample type [`decode_image_into`] can write: `u16` for any precision,
+/// or `u8` for images of at most 8 bits.
+pub trait Sample: sealed::Sealed {}
+
+impl Sample for u8 {}
+impl Sample for u16 {}
+
+/// Read a JPEG-LS stream's frame metadata without decoding its samples.
+///
+/// Every marker segment is parsed and checked as [`decode_image_into`] checks
+/// it, including those between later scans and a height given by a DNL
+/// segment, but each scan's entropy-coded data is skipped over unread. So
+/// this returns the [`ImageInfo`] a decode would, rejects every header error a
+/// decode would, and leaves only errors in the coded data to the decode. It
+/// costs one pass over the stream's bytes, looking for markers.
+pub fn read_header(data: &[u8]) -> Result<ImageInfo, CodecError> {
+    let mut dec = Decoder::new(data);
+    let header = dec.read_header()?;
+    Ok(dec.decode_scans(&header, Coding::T87, None)?.0)
+}
+
+/// Decode a JPEG-LS bitstream into `out`, as samples of type `T` arranged by
+/// `layout`, and return the frame metadata.
+///
+/// `out` must hold exactly `width * height * components` samples
+/// ([`ImageInfo::sample_count`]; [`read_header`] gives it before decoding),
+/// or this returns `DimensionMismatch` with the two sample counts. `u8` output
+/// needs a precision of at most 8 bits, or this returns `InvalidParameter`.
+/// Both are checked before anything is written. Otherwise it decodes exactly
+/// what [`decode_image`] does, without allocating the image. After an error
+/// the contents of `out` are unspecified.
+///
+/// ```
+/// use jpegls::{decode_image_into, encode_image, read_header, EncodeOptions, Layout};
+///
+/// let planar: Vec<u16> = (0..3 * 16).map(|i| i * 5 % 256).collect(); // R, G, B planes
+/// let mut rgb = Vec::new();
+/// encode_image(&planar, 4, 4, 3, &EncodeOptions::default(), &mut rgb).unwrap();
+///
+/// let info = read_header(&rgb).unwrap();
+/// assert_eq!((info.width, info.height, info.components), (4, 4, 3));
+/// let mut pixels = vec![0u8; info.sample_count()]; // RGBRGB…
+/// decode_image_into(&rgb, &mut pixels, Layout::Interleaved).unwrap();
+/// assert_eq!(pixels[..3], [planar[0], planar[16], planar[32]].map(|v| v as u8));
+/// ```
+pub fn decode_image_into<T: Sample>(
+    data: &[u8],
+    out: &mut [T],
+    layout: Layout,
+) -> Result<ImageInfo, CodecError> {
+    let mut dec = Decoder::new(data);
+    let header = dec.read_header()?;
+    dec.decode_into(&header, out, layout)
 }
 
 // ---------------------------------------------------------------------------
@@ -306,6 +458,16 @@ impl<'a> Decoder<'a> {
             b = self.read_byte()?;
         }
         let marker = 0xFF00u16 | u16::from(b);
+        // 0xFF then a byte below 0x80 is scan data (the encoder stuffs a zero
+        // bit after every 0xFF), never a marker, and an RSTm belongs inside a
+        // scan with restart intervals, where the scan decoder reads it. CharLS
+        // rejects both here too. Skipping them as segments would read a
+        // length that is not there.
+        if b < 0x80 || (0xD0..=0xD7).contains(&b) {
+            return Err(CodecError::InvalidData(format!(
+                "0x{marker:04X} where a marker segment should start"
+            )));
+        }
 
         let length = self.read_u16be()? as usize;
         // Length field includes its own 2 bytes.
@@ -661,11 +823,10 @@ impl<'a> Decoder<'a> {
     /// The frame height from the DNL segment that ends the first scan, read
     /// ahead of decoding it, as CharLS does.
     ///
-    /// Scan data never holds `0xFF` followed by a byte of `0x80` or more, so
-    /// the first such pair after the scan header, other than fill bytes and
-    /// restart markers, starts the next segment, which must be the DNL (T.81
-    /// B.2.5). Its line count is 2, 3 or 4 bytes (T.87 C.2.6). CharLS gives
-    /// up at a restart marker instead, so it cannot read DNL with restarts.
+    /// The segment after the first scan's data (see [`scan_data_len`]) must be
+    /// the DNL (T.81 B.2.5). Its line count is 2, 3 or 4 bytes (T.87 C.2.6).
+    /// CharLS gives up at a restart marker instead, so it cannot read DNL with
+    /// restarts.
     fn find_dnl_height(&self) -> Result<usize, CodecError> {
         let data = &self.data[self.pos..];
         let not_found = || {
@@ -673,15 +834,9 @@ impl<'a> Decoder<'a> {
                 "SOF55 height is 0 but no DNL segment ends the first scan".into(),
             )
         };
-        let mut i = 0;
-        while i + 1 < data.len() {
-            let code = data[i + 1];
-            if data[i] != 0xFF || code < 0x80 || code == 0xFF || (0xD0..=0xD7).contains(&code) {
-                i += 1;
-                continue;
-            }
-            if u16::from_be_bytes([0xFF, code]) != MARKER_DNL {
-                break;
+        if let Some(i) = scan_data_len(data) {
+            if u16::from_be_bytes([0xFF, data[i + 1]]) != MARKER_DNL {
+                return Err(not_found());
             }
             let length = data
                 .get(i + 2..i + 4)
@@ -757,45 +912,87 @@ impl<'a> Decoder<'a> {
                 )?;
                 pixels
             }
-            Profile::T87 => self.decode_frame(header)?.samples,
+            Profile::T87 => {
+                let mut pixels = vec![0u16; frame.sample_count()];
+                self.decode_into(&header, &mut pixels, Layout::Planar)?;
+                pixels
+            }
         };
 
         Ok((pixels, exp_width, exp_height))
     }
 
-    /// Decode the frame's scans (the first SOS is already parsed) and check
-    /// the trailing EOI. T.87 path only.
+    /// Decode the frame (its first SOS already parsed) into `out`, which must
+    /// fit it exactly, then undo any HP colour transform there. T.87 path only.
+    fn decode_into<T: Sample>(
+        &mut self,
+        header: &Header,
+        out: &mut [T],
+        layout: Layout,
+    ) -> Result<ImageInfo, CodecError> {
+        let frame = header.frame;
+        let expected = frame.sample_count();
+        if out.len() != expected {
+            return Err(CodecError::DimensionMismatch {
+                expected,
+                actual: out.len(),
+            });
+        }
+        if frame.precision > T::BITS {
+            return Err(CodecError::InvalidParameter {
+                name: "bits_per_sample",
+                value: i64::from(frame.precision),
+                allowed: "at most 8 for u8 output",
+            });
+        }
+        let mut output = Output {
+            samples: &mut *out,
+            layout,
+            width: frame.width,
+            height: frame.height,
+            components: frame.components,
+        };
+        let (info, transform) = self.decode_frame(header, &mut output)?;
+        if transform != 0 {
+            inverse_hp_transform(out, layout, transform, frame.precision);
+        }
+        Ok(info)
+    }
+
+    /// Decode the frame's scans into `out` and check the trailing EOI,
+    /// returning the frame metadata and the HP colour transform still to undo.
     ///
     /// If the T.87 decode fails, the scans are decoded again under each CharLS
     /// variant the header makes possible ([`Coding::retries`]); the first that
-    /// succeeds wins, and otherwise the T.87 error is returned.
-    fn decode_frame(&mut self, header: Header) -> Result<DecodedImage, CodecError> {
-        if header.segments.transform != 0 {
-            let scan = &header.scan;
-            check_transform(
-                header.segments.transform,
-                &header.frame,
-                scan.ilv,
-                scan.near,
-            )?;
-        }
+    /// succeeds wins, and otherwise the T.87 error is returned. Each attempt
+    /// writes every sample, so nothing of a failed one survives.
+    fn decode_frame(
+        &mut self,
+        header: &Header,
+        out: &mut dyn RowSink,
+    ) -> Result<(ImageInfo, u8), CodecError> {
         let start = self.pos;
-        let error = match self.decode_scans(&header, Coding::T87) {
-            Ok(image) => return Ok(image),
+        let error = match self.decode_scans(header, Coding::T87, Some(&mut *out)) {
+            Ok(decoded) => return Ok(decoded),
             Err(e @ CodecError::Unsupported(_)) => return Err(e),
             Err(e) => e,
         };
-        for coding in Coding::retries(&header) {
+        for coding in Coding::retries(header) {
             self.pos = start;
-            if let Ok(image) = self.decode_scans(&header, coding) {
-                return Ok(image);
+            if let Ok(decoded) = self.decode_scans(header, coding, Some(&mut *out)) {
+                return Ok(decoded);
             }
         }
         Err(error)
     }
 
-    /// Decode every scan of the frame into component-planar samples under
-    /// `coding`, undo any HP colour transform, then check the trailing EOI.
+    /// Decode every scan of the frame into `out` under `coding`, then check
+    /// the trailing EOI. Returns the frame metadata and the HP colour
+    /// transform in force, which the caller undoes on the finished samples.
+    ///
+    /// With no `out`, the scans' entropy-coded data is skipped instead of
+    /// decoded (see [`scan_data_len`]), while every marker segment is still
+    /// read and checked: this is [`read_header`].
     ///
     /// The scans may interleave differently (one component per scan, or up
     /// to four line- or sample-interleaved), as long as together they cover
@@ -806,14 +1003,15 @@ impl<'a> Decoder<'a> {
         &mut self,
         header: &Header,
         coding: Coding,
-    ) -> Result<DecodedImage, CodecError> {
+        mut out: Option<&mut dyn RowSink>,
+    ) -> Result<(ImageInfo, u8), CodecError> {
         let frame = header.frame;
         let first = header.scan;
+        if header.segments.transform != 0 {
+            check_transform(header.segments.transform, &frame, first.ilv, first.near)?;
+        }
         let mut segments = header.segments.clone();
         let (w, h, nf) = (frame.width, frame.height, frame.components);
-        // w*h*nf cannot overflow: check_frame_size caps it at MAX_SAMPLES.
-        let plane = w * h;
-        let mut samples = vec![0u16; plane * nf];
         let mut decoded = vec![false; nf];
         let mut component_near = vec![0u8; nf];
 
@@ -824,45 +1022,46 @@ impl<'a> Decoder<'a> {
             let ctx = scan_context(&frame, &segments.presets, scan.near, coding)?;
             let ns = scan.components;
             let targets = scan_targets(&segments.component_ids, &decoded, &scan.selectors[..ns]);
-            // Usually the scan's components are consecutive in the frame and
-            // decode straight into their planes; otherwise via a scratch buffer.
-            let first_target = targets[0];
-            let in_place = targets.iter().zip(first_target..).all(|(&t, i)| t == i);
-            let mut scratch = Vec::new();
-            let planes = if in_place {
-                &mut samples[first_target * plane..(first_target + ns) * plane]
-            } else {
-                scratch.resize(ns * plane, 0u16);
-                &mut scratch[..]
-            };
             let scan_start = self.pos;
-            let consumed = decode_scan_t87(
-                &self.data[scan_start..],
-                planes,
-                w,
-                h,
-                scan.ilv,
-                ctx,
-                segments.restart_interval,
-                scan_start,
-            )?;
-            if coding == Coding::CharLsMaxval {
-                // A CharLS encoder keeps every reconstructed sample within NEAR
-                // of a source sample no larger than MAXVAL. Anything beyond
-                // that is not a CharLS stream, so this reading is rejected.
-                let sof_max_val = (1i32 << frame.precision) - 1;
-                let max_val = segments.presets.maxval.unwrap_or(sof_max_val);
-                let limit = (max_val + scan.near).min(sof_max_val);
-                if planes.iter().any(|&s| i32::from(s) > limit) {
-                    return Err(CodecError::InvalidData(format!(
-                        "samples above MAXVAL {max_val} + NEAR {} under CharLS coding",
-                        scan.near
-                    )));
+            let consumed = match out.as_deref_mut() {
+                Some(out) => {
+                    // A CharLS encoder keeps every reconstructed sample within
+                    // NEAR of a source sample no larger than MAXVAL. Anything
+                    // beyond that is not a CharLS stream, so this reading is
+                    // rejected.
+                    let sof_max_val = (1i32 << frame.precision) - 1;
+                    let max_val = segments.presets.maxval.unwrap_or(sof_max_val);
+                    let mut rows = ScanRows {
+                        out,
+                        targets: &targets,
+                        limit: (coding == Coding::CharLsMaxval)
+                            .then(|| (max_val + scan.near).min(sof_max_val)),
+                        over_limit: false,
+                    };
+                    let consumed = decode_scan_t87(
+                        &self.data[scan_start..],
+                        &mut rows,
+                        w,
+                        h,
+                        ns,
+                        scan.ilv,
+                        ctx,
+                        segments.restart_interval,
+                        scan_start,
+                    )?;
+                    if rows.over_limit {
+                        return Err(CodecError::InvalidData(format!(
+                            "samples above MAXVAL {max_val} + NEAR {} under CharLS coding",
+                            scan.near
+                        )));
+                    }
+                    consumed
                 }
-            }
-            for (&t, src) in targets.iter().zip(scratch.chunks_exact(plane)) {
-                samples[t * plane..(t + 1) * plane].copy_from_slice(src);
-            }
+                None => scan_data_len(&self.data[scan_start..]).ok_or(CodecError::Truncated {
+                    offset: self.data.len(),
+                    context: "entropy-coded scan",
+                })?,
+            };
             for &t in &targets {
                 decoded[t] = true;
                 component_near[t] = scan.near as u8;
@@ -883,11 +1082,9 @@ impl<'a> Decoder<'a> {
         let near = component_near.iter().copied().max().unwrap_or(0);
         if segments.transform != 0 {
             check_transform(segments.transform, &frame, first.ilv, i32::from(near))?;
-            inverse_hp_transform(&mut samples, segments.transform, frame.precision);
         }
 
-        Ok(DecodedImage {
-            samples,
+        let info = ImageInfo {
             width: w as u32,
             height: h as u32,
             bits_per_sample: frame.precision as u8,
@@ -895,7 +1092,85 @@ impl<'a> Decoder<'a> {
             interleave_mode: first.ilv,
             near,
             component_near,
-        })
+        };
+        Ok((info, segments.transform))
+    }
+}
+
+/// Where the entropy-coded data at the start of `data` ends: the offset of
+/// the `0xFF` that begins the next marker other than `RSTm`, or `None` if no
+/// marker follows. Scan data never holds `0xFF` followed by a byte of `0x80`
+/// or more (the encoder stuffs a zero bit after every `0xFF`), so the first
+/// such pair, after any `0xFF` fill bytes, is that marker.
+fn scan_data_len(data: &[u8]) -> Option<usize> {
+    let mut i = 0;
+    while let Some(skip) = data[i..].iter().position(|&b| b == 0xFF) {
+        i += skip;
+        let code = *data.get(i + 1)?;
+        if code >= 0x80 && code != 0xFF && !(0xD0..=0xD7).contains(&code) {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Output
+// ---------------------------------------------------------------------------
+
+/// Where decoded lines go: each scan decoder hands over every finished line,
+/// so the hot loops stay the same whatever the output type and layout.
+trait RowSink {
+    /// `line` is row `y` of frame component `component`.
+    fn put_row(&mut self, component: usize, y: usize, line: &[i32]);
+}
+
+/// A caller's sample buffer, `width * height * components` samples of `T`
+/// arranged by `layout`.
+struct Output<'a, T> {
+    samples: &'a mut [T],
+    layout: Layout,
+    width: usize,
+    height: usize,
+    components: usize,
+}
+
+impl<T: Sample> RowSink for Output<'_, T> {
+    fn put_row(&mut self, component: usize, y: usize, line: &[i32]) {
+        let (w, nf) = (self.width, self.components);
+        // One component lies the same either way; take the plain copy.
+        if self.layout == Layout::Planar || nf == 1 {
+            let row = &mut self.samples[(component * self.height + y) * w..][..w];
+            for (dst, &v) in row.iter_mut().zip(line) {
+                *dst = T::from_sample(v);
+            }
+        } else {
+            let row = &mut self.samples[y * w * nf..][..w * nf];
+            for (pixel, &v) in row.chunks_exact_mut(nf).zip(line) {
+                pixel[component] = T::from_sample(v);
+            }
+        }
+    }
+}
+
+/// One scan's view of the output: its `j`-th component is frame component
+/// `targets[j]`. Under [`Coding::CharLsMaxval`] it also notes any sample above
+/// `limit`.
+struct ScanRows<'a, 'o> {
+    out: &'a mut (dyn RowSink + 'o),
+    targets: &'a [usize],
+    limit: Option<i32>,
+    over_limit: bool,
+}
+
+impl ScanRows<'_, '_> {
+    /// `line` is row `y` of the scan's component `j`.
+    fn put(&mut self, j: usize, y: usize, line: &[i32]) {
+        if let Some(limit) = self.limit {
+            self.over_limit |= line.iter().any(|&v| v > limit);
+        }
+        self.out.put_row(self.targets[j], y, line);
     }
 }
 
@@ -953,8 +1228,9 @@ fn check_transform(
     }
 }
 
-/// Undo HP colour transform 1, 2 or 3 in place on three planes of `2^P`
-/// samples (P = 8 or 16), as the HP codec and CharLS define them:
+/// Undo HP colour transform 1, 2 or 3 in place on a three-component image
+/// of `2^P` samples (P = 8 or 16) arranged by `layout`, as the HP codec and
+/// CharLS define the transforms:
 ///
 /// - HP1: R = V1 + V2 - B, G = V2, B = V3 + V2 - B;
 /// - HP2: R = V1 + V2 - B, G = V2, B = V3 + (R + G) / 2 - B;
@@ -962,19 +1238,17 @@ fn check_transform(
 ///
 /// with `B = 2^(P-1)`, halving by an arithmetic shift, and every result taken
 /// modulo `2^P`.
-fn inverse_hp_transform(samples: &mut [u16], transform: u8, precision: u32) {
+fn inverse_hp_transform<T: Sample>(
+    samples: &mut [T],
+    layout: Layout,
+    transform: u8,
+    precision: u32,
+) {
     let range = 1i32 << precision;
     let mask = range - 1;
     let bias = range / 2;
-    let plane = samples.len() / 3;
-    let (first, rest) = samples.split_at_mut(plane);
-    let (second, third) = rest.split_at_mut(plane);
-    for ((s1, s2), s3) in first
-        .iter_mut()
-        .zip(second.iter_mut())
-        .zip(third.iter_mut())
-    {
-        let (v1, v2, v3) = (i32::from(*s1), i32::from(*s2), i32::from(*s3));
+    let invert = |[s1, s2, s3]: [&mut T; 3]| {
+        let (v1, v2, v3) = (s1.to_sample(), s2.to_sample(), s3.to_sample());
         let (r, g, b) = match transform {
             1 => (v1 + v2 - bias, v2, v3 + v2 - bias),
             2 => {
@@ -986,9 +1260,25 @@ fn inverse_hp_transform(samples: &mut [u16], transform: u8, precision: u32) {
                 (v3 + g - bias, g, v2 + g - bias)
             }
         };
-        *s1 = (r & mask) as u16;
-        *s2 = (g & mask) as u16;
-        *s3 = (b & mask) as u16;
+        *s1 = T::from_sample(r & mask);
+        *s2 = T::from_sample(g & mask);
+        *s3 = T::from_sample(b & mask);
+    };
+    match layout {
+        Layout::Interleaved => {
+            for pixel in samples.chunks_exact_mut(3) {
+                let [s1, s2, s3] = pixel else { unreachable!() };
+                invert([s1, s2, s3]);
+            }
+        }
+        Layout::Planar => {
+            let plane = samples.len() / 3;
+            let (first, rest) = samples.split_at_mut(plane);
+            let (second, third) = rest.split_at_mut(plane);
+            for ((s1, s2), s3) in first.iter_mut().zip(second).zip(third) {
+                invert([s1, s2, s3]);
+            }
+        }
     }
 }
 
@@ -1126,9 +1416,8 @@ fn scan_error(e: CodecError, offset: usize) -> CodecError {
     }
 }
 
-/// Decode one entropy-coded scan (T.87 A.4-A.7) into `planes`, the scan's
-/// `Ns` component planes back to back (each `width * height`); returns the
-/// bytes consumed.
+/// Decode one entropy-coded scan (T.87 A.4-A.7) of `ns` components, handing
+/// each finished line to `rows`; returns the bytes consumed.
 ///
 /// - ILV 0: one component, line after line.
 /// - ILV 1 (line interleaved): each line of every component in turn. The
@@ -1145,11 +1434,12 @@ fn scan_error(e: CodecError, offset: usize) -> CodecError {
 /// Every interval starts afresh, as CharLS does: initial statistics and
 /// `RUNindex`, and a previous line of zeros.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn decode_scan_t87(
+fn decode_scan_t87(
     scan_data: &[u8],
-    planes: &mut [u16],
+    rows: &mut ScanRows<'_, '_>,
     width: usize,
     height: usize,
+    ns: usize,
     ilv: u8,
     ctx: ContextModel,
     restart_interval: usize,
@@ -1171,9 +1461,9 @@ pub(crate) fn decode_scan_t87(
         let mut br = BitReader::new(&scan_data[pos..]);
         let base = base_offset + pos;
         match ilv {
-            0 => decode_planar(&mut br, &mut ctx, planes, width, lines, base)?,
-            1 => decode_line_interleaved(&mut br, &mut ctx, planes, width, height, lines, base)?,
-            _ => decode_sample_interleaved(&mut br, &mut ctx, planes, width, height, lines, base)?,
+            0 => decode_planar(&mut br, &mut ctx, rows, width, lines, base)?,
+            1 => decode_line_interleaved(&mut br, &mut ctx, rows, width, ns, lines, base)?,
+            _ => decode_sample_interleaved(&mut br, &mut ctx, rows, width, ns, lines, base)?,
         }
         pos += br.marker_pos();
         if end_line == height {
@@ -1220,15 +1510,16 @@ fn expect_restart_marker(
 fn decode_planar(
     br: &mut BitReader<'_>,
     ctx: &mut ContextModel,
-    plane: &mut [u16],
+    rows: &mut ScanRows<'_, '_>,
     width: usize,
     lines: Range<usize>,
     base_offset: usize,
 ) -> Result<(), CodecError> {
     let mut prev = vec![0i32; width + 2];
     let mut cur = vec![0i32; width + 2];
-    for row in plane[lines.start * width..lines.end * width].chunks_exact_mut(width) {
-        decode_line(br, ctx, &mut prev, &mut cur, row, base_offset)?;
+    for y in lines {
+        decode_line(br, ctx, &mut prev, &mut cur, width, base_offset)?;
+        rows.put(0, y, &cur[1..=width]);
         std::mem::swap(&mut prev, &mut cur);
     }
     Ok(())
@@ -1240,22 +1531,20 @@ fn decode_planar(
 fn decode_line_interleaved(
     br: &mut BitReader<'_>,
     ctx: &mut ContextModel,
-    planes: &mut [u16],
+    rows: &mut ScanRows<'_, '_>,
     width: usize,
-    height: usize,
+    ns: usize,
     lines: Range<usize>,
     base_offset: usize,
 ) -> Result<(), CodecError> {
-    let plane = width * height;
-    let ns = planes.len() / plane;
     let mut buffers = vec![[vec![0i32; width + 2], vec![0i32; width + 2]]; ns];
     let mut run_index = [0usize; MAX_SCAN_COMPONENTS];
     for y in lines {
         for (c, [prev, cur]) in buffers.iter_mut().enumerate() {
             ctx.run_index = run_index[c];
-            let row = &mut planes[c * plane + y * width..][..width];
-            decode_line(br, ctx, prev, cur, row, base_offset)?;
+            decode_line(br, ctx, prev, cur, width, base_offset)?;
             run_index[c] = ctx.run_index;
+            rows.put(c, y, &cur[1..=width]);
             std::mem::swap(prev, cur);
         }
     }
@@ -1268,42 +1557,35 @@ fn decode_line_interleaved(
 fn decode_sample_interleaved(
     br: &mut BitReader<'_>,
     ctx: &mut ContextModel,
-    planes: &mut [u16],
+    rows: &mut ScanRows<'_, '_>,
     width: usize,
-    height: usize,
+    ns: usize,
     lines: Range<usize>,
     base_offset: usize,
 ) -> Result<(), CodecError> {
-    let plane = width * height;
-    let ns = planes.len() / plane;
     let mut prev = vec![vec![0i32; width + 2]; ns];
     let mut cur = prev.clone();
     for y in lines {
         decode_line_sample(br, ctx, &mut prev, &mut cur, width, base_offset)?;
         for (c, line) in cur.iter().enumerate() {
-            let row = &mut planes[c * plane + y * width..][..width];
-            for (dst, &v) in row.iter_mut().zip(&line[1..=width]) {
-                *dst = v as u16;
-            }
+            rows.put(c, y, &line[1..=width]);
         }
         std::mem::swap(&mut prev, &mut cur);
     }
     Ok(())
 }
 
-/// Decode one line of one component into `cur` (offset-1 layout, see
-/// [`run_mode`]) and `out_row`, whose length is the line width. Sets the
-/// line's edge slots (T.87 A.2.1) first.
+/// Decode one line of one component, `width` samples, into `cur` (offset-1
+/// layout, see [`run_mode`]). Sets the line's edge slots (T.87 A.2.1) first.
 #[inline(always)]
 fn decode_line(
     br: &mut BitReader<'_>,
     ctx: &mut ContextModel,
     prev: &mut [i32],
     cur: &mut [i32],
-    out_row: &mut [u16],
+    width: usize,
     base_offset: usize,
 ) -> Result<(), CodecError> {
-    let width = out_row.len();
     cur[0] = prev[1];
     prev[width + 1] = prev[width];
 
@@ -1317,20 +1599,14 @@ fn decode_line(
         // All three gradients within NEAR <=> context id 0: run mode.
         let qs = ctx.context_id(rd - rb, rb - rc, rc - ra);
         if qs == 0 {
-            let before = x;
             x = match run_mode::decode_run(br, ctx, cur, prev, x, width) {
                 Ok(v) => v,
                 Err(e) => return Err(scan_error(e, base_offset + br.pos())),
             };
-            for (dst, slot) in out_row[before..x].iter_mut().zip(&cur[before + 1..x + 1]) {
-                *dst = *slot as u16;
-            }
             continue;
         }
 
-        let recon = decode_regular(br, ctx, qs, [ra, rb, rc], base_offset)?;
-        cur[x + 1] = recon;
-        out_row[x] = recon as u16;
+        cur[x + 1] = decode_regular(br, ctx, qs, [ra, rb, rc], base_offset)?;
         x += 1;
     }
     Ok(())
@@ -2399,15 +2675,26 @@ mod tests {
                 };
                 let n = rgb.len();
                 let mut planar = vec![0u16; 3 * n];
+                let mut interleaved = vec![0u16; 3 * n];
                 for (i, &px) in rgb.iter().enumerate() {
                     for (c, v) in forward(px).into_iter().enumerate() {
                         planar[c * n + i] = v as u16;
+                        interleaved[3 * i + c] = v as u16;
                     }
                 }
-                inverse_hp_transform(&mut planar, transform, precision);
+                let mut narrow: Vec<u8> = interleaved.iter().map(|&v| v as u8).collect();
+                inverse_hp_transform(&mut planar, Layout::Planar, transform, precision);
+                inverse_hp_transform(&mut interleaved, Layout::Interleaved, transform, precision);
+                inverse_hp_transform(&mut narrow, Layout::Interleaved, transform, precision);
                 for (i, px) in rgb.iter().enumerate() {
                     let back = [planar[i], planar[n + i], planar[2 * n + i]].map(i32::from);
                     assert_eq!(back, *px, "HP{transform}, P = {precision}, pixel {i}");
+                    let back = [0, 1, 2].map(|c| i32::from(interleaved[3 * i + c]));
+                    assert_eq!(back, *px, "HP{transform}, P = {precision}, pixel {i}");
+                    if precision == 8 {
+                        let back = [0, 1, 2].map(|c| i32::from(narrow[3 * i + c]));
+                        assert_eq!(back, *px, "HP{transform} as u8, pixel {i}");
+                    }
                 }
             }
         }
@@ -2691,6 +2978,141 @@ mod tests {
         assert_eq!(img.components, 1);
         assert_eq!((img.width, img.height), (w, h));
         assert_eq!(img.samples, pixels);
+    }
+
+    fn rgb_planes(w: usize, h: usize) -> Vec<Vec<u16>> {
+        (0..3)
+            .map(|c| {
+                textured(w, h, 255)
+                    .iter()
+                    .map(|&v| (v + c * 60) % 256)
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn read_header_reports_without_decoding() {
+        // Every header is read but no entropy-coded data is decoded, so a
+        // stream whose second scan is corrupt still gives its metadata.
+        let rgb = build_planar_rgb(&rgb_planes(16, 16), 16, 16, 8);
+        let info = read_header(&rgb).unwrap();
+        assert_eq!(
+            (
+                info.width,
+                info.height,
+                info.bits_per_sample,
+                info.components
+            ),
+            (16, 16, 8, 3)
+        );
+        assert_eq!(
+            (info.interleave_mode, info.near, &info.component_near[..]),
+            (0, 0, &[0, 0, 0][..])
+        );
+        assert_eq!(info.sample_count(), 16 * 16 * 3);
+        let mut corrupt = rgb.clone();
+        let data = nth_marker(&rgb, 0xDA, 1) + 10;
+        corrupt[data..data + 8].fill(0);
+        assert!(decode_image(&corrupt).is_err());
+        assert_eq!(read_header(&corrupt).unwrap(), info);
+    }
+
+    #[test]
+    fn read_header_checks_every_scan_header() {
+        let rgb = build_planar_rgb(&rgb_planes(5, 4), 5, 4, 8);
+        // NEAR 200 in the last scan exceeds MAXVAL / 2: a header error, which
+        // the header read finds as the decode does.
+        let mut bad = rgb.clone();
+        bad[nth_marker(&rgb, 0xDA, 2) + 7] = 200;
+        for result in [
+            read_header(&bad),
+            decode_image(&bad).map(|_| unreachable!()),
+        ] {
+            assert!(
+                matches!(
+                    result,
+                    Err(CodecError::InvalidParameter { name: "near", .. })
+                ),
+                "{result:?}"
+            );
+        }
+        // A stream that stops inside a scan, or lacks its EOI, is truncated.
+        let cut = &rgb[..nth_marker(&rgb, 0xDA, 2) + 12];
+        assert!(matches!(
+            read_header(cut),
+            Err(CodecError::Truncated { .. })
+        ));
+        assert!(read_header(&rgb[..rgb.len() - 2]).is_err());
+    }
+
+    #[test]
+    fn non_markers_between_scans_rejected() {
+        // 0xFF then a byte below 0x80 is not a marker, and an RSTm belongs
+        // inside a scan. Read as segments, they used to be skipped by their
+        // "length", which could hide a marker, here an EOI, behind them.
+        let rgb = build_planar_rgb(&rgb_planes(5, 4), 5, 4, 8);
+        let second = nth_marker(&rgb, 0xDA, 1);
+        for junk in [
+            &[0xFF, 0x00, 0x00, 0x04, 0xFF, 0xD9][..],
+            &[0xFF, 0x7F, 0x00, 0x02],
+            &[0xFF, 0xD0, 0x00, 0x02],
+        ] {
+            let mut s = rgb[..second].to_vec();
+            s.extend_from_slice(junk);
+            s.extend_from_slice(&rgb[second..]);
+            assert!(
+                matches!(decode_image(&s), Err(CodecError::InvalidData(_))),
+                "{junk:02X?}"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_image_into_interleaves_and_narrows() {
+        let planes = rgb_planes(5, 4);
+        let rgb = build_planar_rgb(&planes, 5, 4, 8);
+        let mut out = vec![0u8; 60];
+        let info = decode_image_into(&rgb, &mut out, Layout::Interleaved).unwrap();
+        assert_eq!(info, read_header(&rgb).unwrap());
+        for (i, pixel) in out.chunks_exact(3).enumerate() {
+            assert_eq!(pixel, [0, 1, 2].map(|c| planes[c][i] as u8), "pixel {i}");
+        }
+        let mut out = vec![0u16; 60];
+        decode_image_into(&rgb, &mut out, Layout::Planar).unwrap();
+        assert_eq!(out, planes.concat());
+    }
+
+    #[test]
+    fn decode_image_into_checks_its_buffer_first() {
+        // A buffer of the wrong length, or u8 for more than 8 bits, is refused
+        // before anything is written to it.
+        let planes = rgb_planes(5, 4);
+        let rgb = build_planar_rgb(&planes, 5, 4, 8);
+        for len in [0, 59, 61] {
+            let mut out = vec![7u16; len];
+            let result = decode_image_into(&rgb, &mut out, Layout::Planar);
+            assert!(
+                matches!(result, Err(CodecError::DimensionMismatch { expected: 60, actual }) if actual == len),
+                "{result:?}"
+            );
+            assert!(out.iter().all(|&v| v == 7));
+        }
+        let wide = build_planar_rgb(&planes, 5, 4, 12);
+        let mut out = vec![7u8; 60];
+        let result = decode_image_into(&wide, &mut out, Layout::Interleaved);
+        assert!(
+            matches!(
+                result,
+                Err(CodecError::InvalidParameter {
+                    name: "bits_per_sample",
+                    value: 12,
+                    ..
+                })
+            ),
+            "{result:?}"
+        );
+        assert!(out.iter().all(|&v| v == 7));
     }
 
     #[test]

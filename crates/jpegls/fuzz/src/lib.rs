@@ -141,9 +141,16 @@ impl ImageSpec {
 /// preset applies).
 pub fn assert_image_contract(img: &jpegls::DecodedImage, max_sample: Option<u32>) {
     assert!(img.components >= 1, "components = {}", img.components);
-    assert!(img.interleave_mode <= 2, "interleave_mode = {}", img.interleave_mode);
+    assert!(
+        img.interleave_mode <= 2,
+        "interleave_mode = {}",
+        img.interleave_mode
+    );
     if img.components == 1 {
-        assert_eq!(img.interleave_mode, 0, "a single component is never interleaved");
+        assert_eq!(
+            img.interleave_mode, 0,
+            "a single component is never interleaved"
+        );
     }
     assert_eq!(img.component_near.len(), usize::from(img.components));
     assert_eq!(
@@ -165,9 +172,70 @@ pub fn assert_image_contract(img: &jpegls::DecodedImage, max_sample: Option<u32>
     );
 }
 
-/// For a single-component stream `decode_image` accepted, `decode` at the
-/// stream's own dimensions must accept it too and return the same samples.
+/// For a stream `decode_image` accepted, the other entry points must agree:
+///
+/// - `read_header` accepts it and gives the same metadata;
+/// - `decode_image_into` gives the same samples in both layouts, as `u16`
+///   and, for at most 8 bits, as `u8` (more bits must be refused);
+/// - for a single component, `decode` at the stream's own dimensions.
 pub fn assert_decode_agrees(data: &[u8], img: &jpegls::DecodedImage) {
+    let info = jpegls::read_header(data).expect("read_header rejected a stream that decodes");
+    assert_eq!(
+        (
+            info.width,
+            info.height,
+            info.bits_per_sample,
+            info.components,
+            info.interleave_mode,
+            info.near,
+            &info.component_near
+        ),
+        (
+            img.width,
+            img.height,
+            img.bits_per_sample,
+            img.components,
+            img.interleave_mode,
+            img.near,
+            &img.component_near
+        ),
+        "read_header and decode_image disagree"
+    );
+
+    let nf = usize::from(img.components);
+    let plane = img.samples.len() / nf;
+    let interleaved: Vec<u16> = (0..img.samples.len())
+        .map(|i| img.samples[(i % nf) * plane + i / nf])
+        .collect();
+    for (layout, expected) in [
+        (jpegls::Layout::Planar, &img.samples),
+        (jpegls::Layout::Interleaved, &interleaved),
+    ] {
+        let mut wide = vec![0u16; info.sample_count()];
+        let got = jpegls::decode_image_into(data, &mut wide, layout)
+            .expect("decode_image_into rejected a stream decode_image accepted");
+        assert_eq!(got, info, "decode_image_into metadata, {layout:?}");
+        assert_eq!(&wide, expected, "decode_image_into samples, {layout:?}");
+        let mut narrow = vec![0u8; info.sample_count()];
+        let result = jpegls::decode_image_into(data, &mut narrow, layout);
+        if img.bits_per_sample <= 8 {
+            result.expect("decode_image_into rejected u8 output for <= 8 bits");
+            assert!(
+                narrow
+                    .iter()
+                    .map(|&v| u16::from(v))
+                    .eq(expected.iter().copied()),
+                "decode_image_into u8 samples, {layout:?}"
+            );
+        } else {
+            assert!(
+                result.is_err(),
+                "u8 output accepted for {} bits",
+                img.bits_per_sample
+            );
+        }
+    }
+
     if img.components != 1 {
         return;
     }

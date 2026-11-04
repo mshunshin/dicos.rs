@@ -30,6 +30,14 @@
 //! default thresholds below 8 bits (DCMTK `+pc`), and CharLS's handling of an
 //! LSE `MAXVAL` — so those files decode too.
 //!
+//! # Decoding into a caller's buffer
+//!
+//! [`read_header`] returns a stream's [`ImageInfo`] (geometry, precision,
+//! interleave mode and NEAR) without decoding its samples, and
+//! [`decode_image_into`] decodes into a buffer the caller sized from it, as
+//! `u8` (up to 8 bits) or `u16` samples, pixel-interleaved or
+//! component-planar ([`Layout`]).
+//!
 //! # Profiles
 //!
 //! The default [`Profile::T87`] path is ITU-T T.87 conformant. The
@@ -53,7 +61,10 @@ mod legacy;
 mod predictor;
 mod run_mode;
 
-pub use decode::{decode, decode_image, decode_with_options, DecodedImage};
+pub use decode::{
+    decode, decode_image, decode_image_into, decode_with_options, read_header, DecodedImage,
+    ImageInfo, Layout, Sample,
+};
 pub use encode::{encode, encode_image, encode_with_options};
 pub use error::CodecError;
 
@@ -64,8 +75,9 @@ pub const TRANSFER_SYNTAX_UID: &str = "1.2.840.10008.1.2.4.80";
 /// ship [`decode_image`], 3-component planar (ILV 0) decoding, line- /
 /// sample-interleaved (ILV 1 / 2) decoding, any component count and mixed
 /// interleave across scans, restart markers, HP colour transforms, the
-/// CharLS-coding retries, a NEAR per scan ([`DecodedImage::component_near`])
-/// and a DNL-given height, and absent from codecs that predate them.
+/// CharLS-coding retries, a NEAR per scan ([`DecodedImage::component_near`]),
+/// a DNL-given height, [`read_header`] and [`decode_image_into`], and absent
+/// from codecs that predate them.
 ///
 /// Downstreams that pull this crate from a fork (pending an upstream release)
 /// should use a git dependency pinned to an exact `rev` — a
@@ -75,7 +87,7 @@ pub const TRANSFER_SYNTAX_UID: &str = "1.2.840.10008.1.2.4.80";
 /// cannot silently resolve to a version without these capabilities. The value
 /// lists the capabilities, newest last.
 pub const FEATURE_CAPS: &str =
-    "decode_image;rgb-ilv0-planar;ilv1-line;ilv2-sample;nf-any;mixed-ilv;restart;hp-transform;charls-retry;near-per-scan;dnl";
+    "decode_image;rgb-ilv0-planar;ilv1-line;ilv2-sample;nf-any;mixed-ilv;restart;hp-transform;charls-retry;near-per-scan;dnl;read-header;decode-into";
 
 /// Bitstream profile selecting the entropy-coded scan format.
 ///

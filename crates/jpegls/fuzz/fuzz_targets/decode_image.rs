@@ -10,6 +10,8 @@
 //! - at least one component, interleave mode `0..=2` (0 for one component),
 //!   precision `2..=16`;
 //! - exactly `width * height * components` samples, none above `2^P - 1`;
+//! - `read_header` gives the same metadata, and `decode_image_into` the same
+//!   samples in either layout, as `u16` or (up to 8 bits) `u8`;
 //! - a single-component stream decodes identically through `jpegls::decode`.
 
 use jpegls_fuzz::{assert_decode_agrees, assert_image_contract};

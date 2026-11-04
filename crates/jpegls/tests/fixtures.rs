@@ -9,13 +9,77 @@
 //! Both directories are left out of the published package, so a test skips
 //! (with a note) when its directory is absent, but fails when it is present
 //! and empty.
+//!
+//! Every stream goes through [`decode_checked`], so `read_header` and each
+//! `decode_image_into` output are checked against `decode_image` on all of
+//! them.
 
 mod common;
 
 use std::path::{Path, PathBuf};
 
 use common::{interleave, read_pnm, Pnm};
-use jpegls::{CodecError, DecodedImage};
+use jpegls::{CodecError, DecodedImage, Layout};
+
+/// `decode_image`, and on success a check that `read_header` gives the same
+/// metadata and that `decode_image_into` gives the same samples in both
+/// layouts, as `u16` and (up to 8 bits; otherwise it must refuse) as `u8`.
+fn decode_checked(bytes: &[u8]) -> Result<DecodedImage, CodecError> {
+    let img = jpegls::decode_image(bytes)?;
+    let info = jpegls::read_header(bytes).expect("read_header fails on a stream that decodes");
+    assert_eq!(
+        (
+            info.width,
+            info.height,
+            info.bits_per_sample,
+            info.components,
+            info.interleave_mode,
+            info.near,
+            &info.component_near
+        ),
+        (
+            img.width,
+            img.height,
+            img.bits_per_sample,
+            img.components,
+            img.interleave_mode,
+            img.near,
+            &img.component_near
+        ),
+        "read_header"
+    );
+    let interleaved = interleave(&img.samples, usize::from(img.components));
+    for (layout, expected) in [
+        (Layout::Planar, &img.samples),
+        (Layout::Interleaved, &interleaved),
+    ] {
+        let mut wide = vec![0u16; info.sample_count()];
+        assert_eq!(
+            jpegls::decode_image_into(bytes, &mut wide, layout).unwrap(),
+            info
+        );
+        assert_eq!(&wide, expected, "{layout:?} as u16");
+        let mut narrow = vec![0u8; info.sample_count()];
+        let result = jpegls::decode_image_into(bytes, &mut narrow, layout);
+        if info.bits_per_sample <= 8 {
+            assert_eq!(result.unwrap(), info);
+            assert!(
+                narrow
+                    .iter()
+                    .map(|&v| u16::from(v))
+                    .eq(expected.iter().copied()),
+                "{layout:?} as u8"
+            );
+        } else {
+            assert!(
+                matches!(result, Err(CodecError::InvalidParameter { .. })),
+                "{layout:?} as u8 from {} bits: {result:?}",
+                info.bits_per_sample
+            );
+        }
+    }
+    Ok(img)
+}
 
 fn fixture_dir(name: &str) -> Option<PathBuf> {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -112,7 +176,7 @@ fn dcmtk_streams_decode_exactly() {
     let mut interleaved = 0;
     for (stem, bytes, reference) in dcmtk_streams(&dir) {
         let want = parse_dcmtk_stem(&stem);
-        let img = jpegls::decode_image(&bytes).unwrap_or_else(|e| panic!("{stem}: {e}"));
+        let img = decode_checked(&bytes).unwrap_or_else(|e| panic!("{stem}: {e}"));
         // dcmdjpls is deterministic, so even near-lossless output must match
         // exactly.
         assert_matches(&stem, &img, &reference, 0);
@@ -151,7 +215,7 @@ fn dcmtk_interleaved_truncation_is_an_error() {
         }
         for cut in [bytes.len() / 4, bytes.len() / 2, bytes.len() - 3] {
             assert!(
-                jpegls::decode_image(&bytes[..cut]).is_err(),
+                decode_checked(&bytes[..cut]).is_err(),
                 "{stem}: truncated to {cut} bytes decoded"
             );
         }
@@ -176,7 +240,7 @@ fn dnl_spliced_into_dcmtk_streams() {
             end -= 1;
         }
         stream.splice(end..end, [0xFF, 0xDC, 0x00, 0x04, height[0], height[1]]);
-        let img = jpegls::decode_image(&stream).unwrap_or_else(|e| panic!("{stem}: {e}"));
+        let img = decode_checked(&stream).unwrap_or_else(|e| panic!("{stem}: {e}"));
         assert_matches(&stem, &img, &reference, 0);
     }
 }
@@ -253,7 +317,7 @@ fn mixed_interleave_spliced_from_dcmtk_scans() {
             let mut s = frame.clone();
             s.extend(scans.concat());
             s.extend_from_slice(&[0xFF, 0xD9]);
-            jpegls::decode_image(&s).unwrap_or_else(|e| panic!("ILV {ilv}: {e}"))
+            decode_checked(&s).unwrap_or_else(|e| panic!("ILV {ilv}: {e}"))
         };
         let in_frame_order = [rgb_planes.concat(), mono.clone()].concat();
 
@@ -320,7 +384,7 @@ fn near_per_scan_spliced_from_dcmtk_scans() {
             let mut s = frame.clone();
             s.extend(scans.concat());
             s.extend_from_slice(&[0xFF, 0xD9]);
-            jpegls::decode_image(&s).unwrap_or_else(|e| panic!("ILV {ilv}: {e}"))
+            decode_checked(&s).unwrap_or_else(|e| panic!("ILV {ilv}: {e}"))
         };
         let in_frame_order = [lossless_planes, lossy_planes].concat();
 
@@ -374,8 +438,8 @@ fn charls_generated_streams() {
             .iter()
             .find_map(|p| p.strip_prefix("near"))
             .map_or(0, |n| n.parse().unwrap());
-        let img = jpegls::decode_image(&std::fs::read(&jls).unwrap())
-            .unwrap_or_else(|e| panic!("{stem}: {e}"));
+        let img =
+            decode_checked(&std::fs::read(&jls).unwrap()).unwrap_or_else(|e| panic!("{stem}: {e}"));
         assert_matches(
             &stem,
             &img,
@@ -578,7 +642,7 @@ fn charls_reference_streams() {
     for (stem, expect) in CHARLS_STREAMS {
         let bytes = std::fs::read(dir.join(format!("{stem}.jls")))
             .unwrap_or_else(|e| panic!("{stem}.jls: {e}"));
-        let result = jpegls::decode_image(&bytes);
+        let result = decode_checked(&bytes);
         match expect {
             Expect::Matches {
                 reference,
@@ -593,10 +657,19 @@ fn charls_reference_streams() {
             Expect::Decodes => {
                 result.unwrap_or_else(|e| panic!("{stem}: {e}"));
             }
-            Expect::Unsupported => assert!(
-                matches!(result, Err(CodecError::Unsupported(_))),
-                "{stem}: {result:?}"
-            ),
+            Expect::Unsupported => {
+                assert!(
+                    matches!(result, Err(CodecError::Unsupported(_))),
+                    "{stem}: {result:?}"
+                );
+                // What is unsupported is always in a header, so the header
+                // read must say so too.
+                let header = jpegls::read_header(&bytes);
+                assert!(
+                    matches!(header, Err(CodecError::Unsupported(_))),
+                    "{stem}: read_header {header:?}"
+                );
+            }
             Expect::Fails => assert!(result.is_err(), "{stem} decoded"),
         }
     }
@@ -618,7 +691,9 @@ fn feature_caps_lists_every_capability() {
             "hp-transform",
             "charls-retry",
             "near-per-scan",
-            "dnl"
+            "dnl",
+            "read-header",
+            "decode-into"
         ]
     );
 }
